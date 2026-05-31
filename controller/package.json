@@ -1,0 +1,15 @@
+{
+  "name": "ai-controller",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Controls opencode daemon(s) via @opencode-ai/sdk",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.15.12",
+    "undici": "^6.21.0"
+  }
+}

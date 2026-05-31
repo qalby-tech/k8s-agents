@@ -1,0 +1,36 @@
+# ~/.ssh/config for the AI daemon — rendered by the operator per namespace/fleet.
+#
+# The global block gives every target connection multiplexing (one persistent
+# master socket, reused by every `fleet` call) + auto-reconnect + pinned host keys
+# + the fleet's single private key. Per-target Host blocks add HostName/User.
+#
+# Security: StrictHostKeyChecking=yes with a pinned UserKnownHostsFile (the operator
+# collects each target's host key at onboarding) prevents MITM. IdentitiesOnly=yes
+# stops the agent from offering other keys.
+
+Host *
+  ControlMaster auto
+  ControlPath ~/.ssh/cm/%r@%h:%p
+  ControlPersist 10m
+  ServerAliveInterval 15
+  ServerAliveCountMax 3
+  StrictHostKeyChecking yes
+  UserKnownHostsFile ~/.ssh/known_hosts.fleet
+  IdentityFile ~/.ssh/id_ed25519_fleet
+  IdentitiesOnly yes
+  ConnectTimeout 10
+
+# ── per-target blocks (rendered from the fleet manifest) ─────────────────────
+# Host alias MUST equal the "name" in targets.json.
+
+Host web1
+  HostName 10.0.0.5
+  User agent
+
+Host desk1
+  HostName 10.0.0.6
+  User ubuntu
+
+Host win1
+  HostName 10.0.0.7
+  User agent

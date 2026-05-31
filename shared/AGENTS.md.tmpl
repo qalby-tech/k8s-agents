@@ -1,0 +1,61 @@
+# Your fleet
+
+You control a fleet of remote machines. You reach all of them with the `fleet`
+command (run it via your shell tool). There are **no other network endpoints** —
+shell and GUI both go over SSH. You never handle SSH keys, hosts, or ports
+yourself; `fleet` and your config already have them.
+
+## Targets
+<!-- rendered by the operator from the fleet manifest -->
+| name  | kind     | os      | use it for                          |
+|-------|----------|---------|-------------------------------------|
+| web1  | terminal | linux   | shell, files, running programs      |
+| desk1 | gui      | linux   | desktop apps, browser, clicking     |
+| win1  | gui      | windows | Windows desktop apps                 |
+
+## Terminal targets — run commands
+```
+fleet run  <name> <command...>      # e.g. fleet run web1 ls -la /srv
+fleet push <name> <local> <remote>  # copy a file up
+fleet pull <name> <remote> <local>  # copy a file down
+```
+
+## GUI targets — see and act on the desktop
+A GUI target also accepts everything above (it has a shell), PLUS screen control.
+**Loop: screenshot → read it → act → screenshot again to confirm.** Coordinates
+are screen pixels (top-left origin).
+
+```
+fleet screenshot <name> <out.png>   # capture the screen to a file, then VIEW it
+fleet gui <name> click  <x> <y>     # left click
+fleet gui <name> rclick <x> <y>     # right click
+fleet gui <name> dclick <x> <y>     # double click
+fleet gui <name> move   <x> <y>     # move cursor
+fleet gui <name> scroll <dx> <dy>   # scroll
+fleet gui <name> type  "text"       # type text
+fleet gui <name> key   <keyname>    # press one key (e.g. Return, Tab, Escape)
+fleet gui <name> hotkey ctrl l      # press a key combo (each key a separate arg)
+```
+Action calls reply `{"success":true}` (or an error); `fleet screenshot` writes a PNG.
+
+Typical step:
+```
+fleet screenshot desk1 /tmp/s.png    # then view /tmp/s.png to locate the target
+fleet gui desk1 click 740 410        # click it
+fleet screenshot desk1 /tmp/s.png    # confirm the result
+```
+
+## Running an app in the background
+The GUI targets have a live logged-in desktop session. Launch apps non-blocking,
+then drive them by screenshot:
+```
+fleet run desk1 'DISPLAY=:0 nohup firefox >/dev/null 2>&1 &'   # linux
+fleet run win1  'start "" msedge'                              # windows
+```
+Give the app a moment to appear, then screenshot before clicking.
+
+## Notes
+- Always screenshot **after** an action to verify it landed — do not assume.
+- If a click misses, re-screenshot and recompute coordinates; the layout may have
+  shifted or scrolled.
+- Connections are kept warm automatically; you don't need to connect/disconnect.

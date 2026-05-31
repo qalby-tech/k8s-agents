@@ -1,0 +1,59 @@
+# Reusable image build/push. Reads the version from <project>/version.toml and
+# pushes kamasalyamov/agents:<prefix>-<version> and :<prefix>-latest to Docker Hub.
+name: docker
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: "Directory holding version.toml (e.g. engines/opencode)"
+        required: true
+        type: string
+      prefix:
+        description: "Image tag prefix (e.g. opencode)"
+        required: true
+        type: string
+      context:
+        description: "Docker build context"
+        required: false
+        default: "."
+        type: string
+      dockerfile:
+        description: "Path to the Dockerfile"
+        required: true
+        type: string
+
+env:
+  IMAGE: kamasalyamov/agents
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: v
+        run: |
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' "${{ inputs.project }}/version.toml")
+          if [ -z "$version" ]; then echo "no version in ${{ inputs.project }}/version.toml" >&2; exit 1; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building ${{ inputs.prefix }}-$version"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ inputs.prefix }}-${{ steps.v.outputs.version }}
+            ${{ env.IMAGE }}:${{ inputs.prefix }}-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

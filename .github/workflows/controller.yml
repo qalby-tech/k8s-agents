@@ -1,0 +1,18 @@
+name: controller
+on:
+  push:
+    branches: [main]
+    paths:
+      - "controller/**"
+      - ".github/workflows/controller.yml"
+      - ".github/workflows/_docker.yml"
+  workflow_dispatch:
+jobs:
+  image:
+    uses: ./.github/workflows/_docker.yml
+    secrets: inherit
+    with:
+      project: controller
+      prefix: controller
+      context: controller
+      dockerfile: controller/Dockerfile

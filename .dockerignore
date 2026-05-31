@@ -1,0 +1,7 @@
+# Repo-root build context (used by engine images). Keep it lean.
+.git
+.github
+**/node_modules
+operator
+controller/node_modules
+*.md

@@ -1,0 +1,19 @@
+name: engine-opencode
+on:
+  push:
+    branches: [main]
+    paths:
+      - "engines/opencode/**"
+      - "shared/**"
+      - ".github/workflows/engine-opencode.yml"
+      - ".github/workflows/_docker.yml"
+  workflow_dispatch:
+jobs:
+  image:
+    uses: ./.github/workflows/_docker.yml
+    secrets: inherit
+    with:
+      project: engines/opencode
+      prefix: opencode
+      context: .
+      dockerfile: engines/opencode/Dockerfile

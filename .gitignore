@@ -1,0 +1,13 @@
+# Go
+operator/bin/
+*.test
+*.out
+
+# Node
+**/node_modules/
+npm-debug.log*
+
+# Local
+*.log
+.DS_Store
+.env
