@@ -1,0 +1,73 @@
+#!/bin/sh
+# agent-bootstrap — one-time, idempotent setup the daemon runs against its VM on
+# startup (no cloud-init dependency, works on already-running VMs):
+#   1. install the daemon's SSH public key on the VM (password auth, via sshpass)
+#   2. for GUI VMs, install the cua Computer Server bound to 127.0.0.1:8000
+# After this the daemon uses key auth (ssh vm ...) and, on desktops, drives the
+# screen via `ssh vm 'curl 127.0.0.1:8000/cmd'`.
+#
+# Reads the per-VM daemon Secret mounted at /etc/aidaemon (vm_user, vm_password,
+# vm_gui) and ~/.ssh (laid out by the init container: id_ed25519_fleet[.pub],
+# config with `Host vm`). Runs in the background of the engine entrypoint, so the
+# opencode API is up immediately even while the VM is still booting.
+set -eu
+
+SECRET=/etc/aidaemon
+PUB="$HOME/.ssh/id_ed25519_fleet.pub"
+VM_PASS="$(cat "$SECRET/vm_password" 2>/dev/null || true)"
+VM_GUI="$(cat "$SECRET/vm_gui" 2>/dev/null || echo false)"
+
+log() { echo "[agent-bootstrap] $*"; }
+
+# 1. Install our key on the VM. Force password auth — our key isn't there yet.
+log "installing SSH key on the VM…"
+i=0
+until sshpass -p "$VM_PASS" ssh-copy-id -i "$PUB" \
+        -o StrictHostKeyChecking=accept-new \
+        -o PubkeyAuthentication=no -o PreferredAuthentications=password \
+        -o ConnectTimeout=5 vm >/dev/null 2>&1; do
+  i=$((i + 1))
+  if [ "$i" -ge 60 ]; then log "ERROR: VM unreachable after ~10m — giving up"; exit 1; fi
+  log "VM not reachable yet (try $i); retrying in 10s…"
+  sleep 10
+done
+log "key installed; verifying key auth…"
+ssh -o BatchMode=yes -o ConnectTimeout=10 vm true || { log "ERROR: key auth failed"; exit 1; }
+log "key auth OK"
+
+# 2. GUI VMs: install + start the cua Computer Server on loopback. The desktop
+# autologin/X session (set up by the VM's cloud-init) gives it a display.
+if [ "$VM_GUI" = "true" ]; then
+  log "installing cua Computer Server on the VM…"
+  ssh vm 'bash -s' <<'REMOTE' || log "WARNING: cua install failed (GUI control unavailable)"
+set -e
+export DEBIAN_FRONTEND=noninteractive
+sudo apt-get update -qq
+sudo apt-get install -y -qq python3-pip pipx scrot gnome-screenshot python3-xlib xdotool
+command -v cua-computer-server >/dev/null 2>&1 || pipx install cua-computer-server \
+  || pip3 install --user --break-system-packages cua-computer-server
+BIN="$HOME/.local/bin/cua-computer-server"
+sudo tee /etc/systemd/system/cua-computer-server.service >/dev/null <<UNIT
+[Unit]
+Description=cua Computer Server (loopback) for the AI daemon
+After=graphical.target
+Wants=graphical.target
+[Service]
+User=$(id -un)
+Environment=HOME=$HOME
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=$HOME/.Xauthority
+ExecStartPre=/bin/sleep 5
+ExecStart=$BIN --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=graphical.target
+UNIT
+sudo systemctl daemon-reload
+sudo systemctl enable --now cua-computer-server.service || true
+REMOTE
+  log "cua install step done"
+fi
+
+log "bootstrap complete"
