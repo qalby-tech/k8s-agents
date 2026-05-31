@@ -79,6 +79,7 @@ no auth on a self-hosted loopback server.
 - ✅ `fleet` wrapper, opencode engine image, controller, ssh-sidecar image
 - ✅ Ubuntu GUI cloud-init, pod sidecar injection patch
 - ✅ CI (per-project, version.toml → Docker Hub)
-- 🚧 operator reconcile logic (skeleton compiles; phase-6 TODOs in the reconciler)
+- ✅ operator reconcile: keypair Secret, target discovery, fleet ConfigMap render, daemon Deployment, NetworkPolicy (deploy via `operator/config/`)
+- 🚧 operator: sidecar-injection webhook for pods, host-key collection/pinning, VM (KubeVirt) targets
 - 🚧 Windows sysprep template
 - 🚧 `claude` engine (control shim)

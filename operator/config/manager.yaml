@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-agents-operator
+  namespace: agents-system
+  labels: { app: k8s-agents-operator }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: k8s-agents-operator }
+  template:
+    metadata:
+      labels: { app: k8s-agents-operator }
+    spec:
+      serviceAccountName: k8s-agents-operator
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: manager
+          image: kamasalyamov/agents:operator-latest
+          args: ["--health-probe-bind-address=:8081"]
+          ports:
+            - { name: health, containerPort: 8081 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: health }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
