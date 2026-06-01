@@ -53,6 +53,8 @@ fi
 if [ -f /etc/aidaemon/vm_user ]; then
   echo "[entrypoint] AI daemon mode — bootstrapping VM in background"
   agent-bootstrap >/tmp/agent-bootstrap.log 2>&1 &
+  # Guest-status endpoint on :4097 (cloud-init / cua / key-auth) for the UI.
+  node /usr/local/bin/status-server.mjs >/tmp/status-server.log 2>&1 &
 fi
 
 exec opencode serve --hostname 0.0.0.0 --port 4096

@@ -19,6 +19,8 @@ RUN npm install -g opencode-ai@${OPENCODE_VERSION}
 COPY shared/fleet/fleet /usr/local/bin/fleet
 COPY shared/agent-bootstrap /usr/local/bin/agent-bootstrap
 COPY shared/entrypoint.sh /usr/local/bin/entrypoint.sh
+# status-server: guest-status endpoint (:4097) the UI polls (cloud-init/cua/ssh).
+COPY shared/status-server.mjs /usr/local/bin/status-server.mjs
 RUN chmod +x /usr/local/bin/fleet /usr/local/bin/agent-bootstrap /usr/local/bin/entrypoint.sh
 
 WORKDIR /workspace
@@ -30,5 +32,5 @@ ENV OPENCODE_DATA=/root/.local/share/opencode
 # (along with /etc/fleet/targets.json + ~/.ssh/config).
 COPY shared/AGENTS.md.tmpl /workspace/AGENTS.md
 
-EXPOSE 4096
+EXPOSE 4096 4097
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
