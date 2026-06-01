@@ -19,20 +19,46 @@ VM_GUI="$(cat "$SECRET/vm_gui" 2>/dev/null || echo false)"
 
 log() { echo "[agent-bootstrap] $*"; }
 
+# Status marker the status-server reads so the UI can colour the badge:
+#   running | unreachable | auth-failed | installing-gui | ok
+STATUS=/tmp/agent-bootstrap.status
+echo running >"$STATUS"
+
 # 1. Install our key on the VM. Force password auth — our key isn't there yet.
+# Distinguish "VM not up yet" (keep retrying) from "password rejected" — the
+# latter won't fix itself, so fail fast and tell the UI. We allow a few early
+# "permission denied" tries because cloud-init may not have set the password in
+# the first ~30s of boot.
 log "installing SSH key on the VM…"
 i=0
-until sshpass -p "$VM_PASS" ssh-copy-id -i "$PUB" \
-        -o StrictHostKeyChecking=accept-new \
-        -o PubkeyAuthentication=no -o PreferredAuthentications=password \
-        -o ConnectTimeout=5 vm >/dev/null 2>&1; do
+authfails=0
+while true; do
+  err=$(sshpass -p "$VM_PASS" ssh-copy-id -i "$PUB" \
+          -o StrictHostKeyChecking=accept-new \
+          -o PubkeyAuthentication=no -o PreferredAuthentications=password \
+          -o ConnectTimeout=5 vm 2>&1 >/dev/null) && break
   i=$((i + 1))
-  if [ "$i" -ge 60 ]; then log "ERROR: VM unreachable after ~10m — giving up"; exit 1; fi
+  if printf '%s' "$err" | grep -qi 'permission denied'; then
+    authfails=$((authfails + 1))
+    if [ "$authfails" -ge 6 ]; then
+      log "ERROR: the VM rejected the password — check the VM password"
+      echo auth-failed >"$STATUS"
+      exit 1
+    fi
+  else
+    authfails=0
+  fi
+  if [ "$i" -ge 60 ]; then
+    log "ERROR: VM unreachable after ~10m — giving up"
+    echo unreachable >"$STATUS"
+    exit 1
+  fi
   log "VM not reachable yet (try $i); retrying in 10s…"
   sleep 10
 done
 log "key installed; verifying key auth…"
-ssh -o BatchMode=yes -o ConnectTimeout=10 vm true || { log "ERROR: key auth failed"; exit 1; }
+ssh -o BatchMode=yes -o ConnectTimeout=10 vm true || { log "ERROR: key auth failed"; echo auth-failed >"$STATUS"; exit 1; }
+echo ok >"$STATUS"
 log "key auth OK"
 
 # 2. GUI VMs: install + start the cua Computer Server on loopback. The desktop
@@ -43,9 +69,18 @@ if [ "$VM_GUI" = "true" ]; then
 set -e
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq
-sudo apt-get install -y -qq python3-pip pipx scrot gnome-screenshot python3-xlib xdotool
-command -v cua-computer-server >/dev/null 2>&1 || pipx install cua-computer-server \
-  || pip3 install --user --break-system-packages cua-computer-server
+sudo apt-get install -y -qq python3-pip pipx scrot gnome-screenshot python3-xlib xdotool curl
+if ! command -v cua-computer-server >/dev/null 2>&1; then
+  # uv resolves + downloads cua's (large) dependency tree far faster than
+  # pip/pipx; skip any playwright browser download — cua's /cmd screen control
+  # doesn't need it (playwright is only a transitive dep). pipx/pip3 fallback.
+  export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+  command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+  uv tool install cua-computer-server \
+    || pipx install cua-computer-server \
+    || pip3 install --user --break-system-packages cua-computer-server
+fi
 BIN="$HOME/.local/bin/cua-computer-server"
 sudo tee /etc/systemd/system/cua-computer-server.service >/dev/null <<UNIT
 [Unit]

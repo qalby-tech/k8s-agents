@@ -44,10 +44,15 @@ async function probe() {
         (await ssh("systemctl is-active cua-computer-server 2>/dev/null")).out === "active";
     }
   }
+  // running | unreachable | auth-failed | ok — written by agent-bootstrap. The
+  // UI colours the badge red on "auth-failed" (wrong VM password).
+  const bootstrapStatus = await readFile("/tmp/agent-bootstrap.status", "utf8")
+    .then((s) => s.trim())
+    .catch(() => "");
   const bootstrapTail = await readFile("/tmp/agent-bootstrap.log", "utf8")
     .then((s) => s.trim().split("\n").slice(-3).join("\n"))
     .catch(() => "");
-  return { gui: GUI, sshOk, cloudInit, cuaInstalled, cuaActive, bootstrapTail, ts: Date.now() };
+  return { gui: GUI, sshOk, cloudInit, cuaInstalled, cuaActive, bootstrapStatus, bootstrapTail, ts: Date.now() };
 }
 
 // Cache + single-flight so polling doesn't spawn an SSH storm.
