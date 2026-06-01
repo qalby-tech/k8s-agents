@@ -1,10 +1,9 @@
-# Local end-to-end test: one opencode engine + one controller that drives it.
-# Mirrors the eventual k8s shape (per-ns engine daemon <- controller) on one host.
+# Local smoke test: build + run the opencode engine image (the per-VM AI daemon)
+# on one host. In the platform the same image is deployed per-VM by tenant-
+# operator (charts/agents) and driven through tenant-api — there is no separate
+# controller; a master is just another engine pointed at other engines.
 #
 #   docker compose up --build
-#
-# Real inference check (mounts host opencode creds, set a prompt):
-#   TEST_PROMPT="reply with the single word: pong" docker compose up --build
 services:
   engine:
     build:
@@ -14,7 +13,6 @@ services:
       - "4096:4096"
     volumes:
       # Reuse the host's opencode credentials for local testing.
-      # In k8s this is replaced by a mounted Secret (ProviderCredential CRD).
       - ${HOME}/.local/share/opencode/auth.json:/root/.local/share/opencode/auth.json:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:4096/config"]
@@ -22,14 +20,3 @@ services:
       timeout: 3s
       retries: 20
       start_period: 10s
-
-  controller:
-    build:
-      context: controller
-      dockerfile: Dockerfile
-    environment:
-      OPENCODE_BASE_URL: "http://engine:4096"
-      TEST_PROMPT: "${TEST_PROMPT:-}"
-    depends_on:
-      engine:
-        condition: service_healthy
