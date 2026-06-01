@@ -17,13 +17,31 @@ if [ -f "$AUTH" ] && command -v jq >/dev/null 2>&1; then
   [ -n "$K" ] && export Z_AI_API_KEY="$K"
 fi
 
-# opencode project config (MCP servers) is delivered in the daemon Secret when
-# the chosen provider has MCP vision enabled. Place it where opencode (cwd
-# /workspace) loads it. opencode reads it once at serve start, so this must run
-# before the exec below.
-if [ -f /etc/aidaemon/opencode.json ]; then
-  mkdir -p /workspace
-  cp /etc/aidaemon/opencode.json /workspace/opencode.json
+# MCP vision: when the chosen provider has it enabled (a marker in the daemon
+# Secret) and we have the key, write opencode's GLOBAL config declaring the zai
+# vision MCP server. It must live at ~/.config/opencode/opencode.jsonc — a
+# project-dir opencode.json is not reliably loaded by the served daemon. The key
+# is inlined here (the entrypoint can read the mounted auth.json; tenant-api
+# cannot read the Secret back). 'read' is disabled so a text model can't try to
+# read a screenshot as an image and hang on it — it must use the MCP tool.
+if [ -f /etc/aidaemon/mcp_vision ] && [ -n "${Z_AI_API_KEY:-}" ]; then
+  mkdir -p /root/.config/opencode
+  cat > /root/.config/opencode/opencode.jsonc <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "zai-mcp-server": {
+      "type": "local",
+      "command": ["npx", "-y", "@z_ai/mcp-server"],
+      "environment": {
+        "Z_AI_API_KEY": "${Z_AI_API_KEY}",
+        "Z_AI_MODE": "ZAI"
+      }
+    }
+  },
+  "tools": { "read": false }
+}
+EOF
 fi
 
 if [ -f /etc/aidaemon/vm_user ]; then
