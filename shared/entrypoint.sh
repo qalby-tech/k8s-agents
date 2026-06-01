@@ -17,17 +17,18 @@ if [ -f "$AUTH" ] && command -v jq >/dev/null 2>&1; then
   [ -n "$K" ] && export Z_AI_API_KEY="$K"
 fi
 
-# MCP vision: when the chosen provider has it enabled (a marker in the daemon
-# Secret) and we have the key, write opencode's GLOBAL config declaring the zai
-# vision MCP server. It must live at ~/.config/opencode/opencode.jsonc — a
-# project-dir opencode.json is not reliably loaded by the served daemon. The key
-# is inlined here (the entrypoint can read the mounted auth.json; tenant-api
-# cannot read the Secret back).
+# opencode GLOBAL config at ~/.config/opencode/opencode.jsonc (the location the
+# served daemon actually loads). This is a headless server — there is no human
+# to answer opencode's permission prompts, so allow all tool use, otherwise the
+# agent hangs waiting for an approval that never arrives. Add the zai vision MCP
+# server when the chosen provider has it enabled; the key is inlined from the
+# mounted auth.json (tenant-api cannot read the Secret back to render it).
+mkdir -p /root/.config/opencode
 if [ -f /etc/aidaemon/mcp_vision ] && [ -n "${Z_AI_API_KEY:-}" ]; then
-  mkdir -p /root/.config/opencode
   cat > /root/.config/opencode/opencode.jsonc <<EOF
 {
   "\$schema": "https://opencode.ai/config.json",
+  "permission": { "*": "allow" },
   "mcp": {
     "zai-mcp-server": {
       "type": "local",
@@ -38,6 +39,13 @@ if [ -f /etc/aidaemon/mcp_vision ] && [ -n "${Z_AI_API_KEY:-}" ]; then
       }
     }
   }
+}
+EOF
+else
+  cat > /root/.config/opencode/opencode.jsonc <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "permission": { "*": "allow" }
 }
 EOF
 fi
