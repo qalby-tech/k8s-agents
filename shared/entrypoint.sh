@@ -22,8 +22,7 @@ fi
 # vision MCP server. It must live at ~/.config/opencode/opencode.jsonc — a
 # project-dir opencode.json is not reliably loaded by the served daemon. The key
 # is inlined here (the entrypoint can read the mounted auth.json; tenant-api
-# cannot read the Secret back). 'read' is disabled so a text model can't try to
-# read a screenshot as an image and hang on it — it must use the MCP tool.
+# cannot read the Secret back).
 if [ -f /etc/aidaemon/mcp_vision ] && [ -n "${Z_AI_API_KEY:-}" ]; then
   mkdir -p /root/.config/opencode
   cat > /root/.config/opencode/opencode.jsonc <<EOF
@@ -38,8 +37,7 @@ if [ -f /etc/aidaemon/mcp_vision ] && [ -n "${Z_AI_API_KEY:-}" ]; then
         "Z_AI_MODE": "ZAI"
       }
     }
-  },
-  "tools": { "read": false }
+  }
 }
 EOF
 fi
