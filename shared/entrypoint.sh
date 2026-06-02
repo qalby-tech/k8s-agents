@@ -24,7 +24,23 @@ fi
 # server when the chosen provider has it enabled; the key is inlined from the
 # mounted auth.json (tenant-api cannot read the Secret back to render it).
 mkdir -p /root/.config/opencode
-if [ -f /etc/aidaemon/mcp_vision ] && [ -n "${Z_AI_API_KEY:-}" ]; then
+if [ -f /etc/aimaster/targets.json ]; then
+  # AI Master mode: no VM. Orchestrate the attached slave daemons through the
+  # fleet MCP server, which drives each slave's own opencode API over HTTP.
+  cat > /root/.config/opencode/opencode.jsonc <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "permission": { "*": "allow" },
+  "mcp": {
+    "fleet": {
+      "type": "local",
+      "command": ["node", "/usr/local/bin/fleet-mcp.mjs"],
+      "environment": { "FLEET_TARGETS": "/etc/aimaster/targets.json" }
+    }
+  }
+}
+EOF
+elif [ -f /etc/aidaemon/mcp_vision ] && [ -n "${Z_AI_API_KEY:-}" ]; then
   cat > /root/.config/opencode/opencode.jsonc <<EOF
 {
   "\$schema": "https://opencode.ai/config.json",
