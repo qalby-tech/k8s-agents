@@ -65,16 +65,23 @@ log "key auth OK"
 # autologin/X session (set up by the VM's cloud-init) gives it a display.
 if [ "$VM_GUI" = "true" ]; then
   log "installing cua Computer Server on the VM…"
-  ssh vm 'bash -s' <<'REMOTE' || log "WARNING: cua install failed (GUI control unavailable)"
+  # On a freshly booted VM cloud-init is still running apt (package_update +
+  # packages), so an immediate apt-get here loses the dpkg lock and the whole
+  # install fails. Wait for cloud-init to finish and the lock to clear first.
+  ssh vm 'cloud-init status --wait >/dev/null 2>&1 || true
+          i=0; while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+            i=$((i+1)); [ "$i" -ge 60 ] && break; sleep 5; done' || true
+  cua_try=0
+  while :; do
+    ssh vm 'bash -s' <<'REMOTE' || true
 set -e
-export DEBIAN_FRONTEND=noninteractive
+export DEBIAN_FRONTEND=noninteractive PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 sudo apt-get update -qq
 sudo apt-get install -y -qq python3-pip pipx scrot gnome-screenshot python3-xlib xdotool curl
-if ! command -v cua-computer-server >/dev/null 2>&1; then
+if [ ! -x "$HOME/.local/bin/cua-computer-server" ] && ! command -v cua-computer-server >/dev/null 2>&1; then
   # uv resolves + downloads cua's (large) dependency tree far faster than
   # pip/pipx; skip any playwright browser download — cua's /cmd screen control
   # doesn't need it (playwright is only a transitive dep). pipx/pip3 fallback.
-  export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
   command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
   export PATH="$HOME/.local/bin:$PATH"
   uv tool install cua-computer-server \
@@ -82,6 +89,11 @@ if ! command -v cua-computer-server >/dev/null 2>&1; then
     || pip3 install --user --break-system-packages cua-computer-server
 fi
 BIN="$HOME/.local/bin/cua-computer-server"
+[ -x "$BIN" ] || BIN="$(command -v cua-computer-server)"
+# XAUTHORITY=$HOME/.Xauthority goes stale whenever the X server restarts (login
+# manager restart, reboot) — pynput then fails with "Invalid MIT-MAGIC-COOKIE-1".
+# Refresh it from lightdm's live server auth (root-only, but the path is stable
+# for :0) on every start via a privileged (+) ExecStartPre.
 sudo tee /etc/systemd/system/cua-computer-server.service >/dev/null <<UNIT
 [Unit]
 Description=cua Computer Server (loopback) for the AI daemon
@@ -92,7 +104,8 @@ User=$(id -un)
 Environment=HOME=$HOME
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=$HOME/.Xauthority
-ExecStartPre=/bin/sleep 5
+ExecStartPre=+/bin/sh -c 'for n in 1 2 3 4 5 6; do [ -f /var/run/lightdm/root/:0 ] && cp /var/run/lightdm/root/:0 $HOME/.Xauthority && chown $(id -un):$(id -gn) $HOME/.Xauthority && break; sleep 2; done'
+ExecStartPre=/bin/sleep 3
 ExecStart=$BIN --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=3
@@ -100,9 +113,20 @@ RestartSec=3
 WantedBy=graphical.target
 UNIT
 sudo systemctl daemon-reload
-sudo systemctl enable --now cua-computer-server.service || true
+sudo systemctl enable --now cua-computer-server.service
 REMOTE
-  log "cua install step done"
+    # cua answering (404 on / is healthy — its endpoint is /cmd) means success.
+    if ssh vm 'sleep 6; curl -s -m4 -o /dev/null http://127.0.0.1:8000/'; then
+      log "cua up"; break
+    fi
+    cua_try=$((cua_try + 1))
+    if [ "$cua_try" -ge 3 ]; then
+      log "WARNING: cua install failed after retries (GUI control unavailable)"
+      break
+    fi
+    log "cua not up yet; retry $cua_try in 15s…"
+    sleep 15
+  done
 fi
 
 log "bootstrap complete"
