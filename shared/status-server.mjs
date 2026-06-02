@@ -13,17 +13,21 @@
 // ~/.ssh (Host vm) for the SSH probes — the same hop the agent uses.
 import http from "node:http";
 import { execFile } from "node:child_process";
-import { readFile, readdir, stat, mkdir } from "node:fs/promises";
+import { readFile, readdir, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { join, basename, extname } from "node:path";
 
 const PORT = 4097;
 const OUTBOX = process.env.AGENT_OUTBOX || "/workspace/outbox";
+// Files the USER attaches in the chat, materialized so the agent can open them
+// (a PDF the model can't read is still readable here with tools).
+const INBOX = process.env.AGENT_INBOX || "/workspace/inbox";
 // Master mode has no VM (no /etc/aidaemon/vm_user); skip the SSH probes there.
 const IS_DAEMON = await readFile("/etc/aidaemon/vm_user", "utf8").then(() => true).catch(() => false);
 const GUI = await readFile("/etc/aidaemon/vm_gui", "utf8").then((s) => s.trim() === "true").catch(() => false);
 
 await mkdir(OUTBOX, { recursive: true }).catch(() => {});
+await mkdir(INBOX, { recursive: true }).catch(() => {});
 
 function sh(cmd, args, timeoutMs = 8000) {
   return new Promise((resolve) => {
@@ -122,6 +126,24 @@ http
         if (!st || !st.isFile()) return json(res, 404, { error: "not found" });
         res.writeHead(200, { "content-type": mimeOf(name), "content-length": st.size, "cache-control": "no-store" });
         return createReadStream(full).pipe(res);
+      }
+      // The chat's "remove" button — let the user clear a shared file.
+      if (p.startsWith("/outbox/") && req.method === "DELETE") {
+        const name = basename(decodeURIComponent(p.slice("/outbox/".length)));
+        await unlink(join(OUTBOX, name)).catch(() => {});
+        const cf = join(OUTBOX, ".captions.json");
+        const map = await readFile(cf, "utf8").then((s) => JSON.parse(s)).catch(() => ({}));
+        if (map[name]) { delete map[name]; await writeFile(cf, JSON.stringify(map)).catch(() => {}); }
+        return json(res, 200, { ok: true });
+      }
+      // User attachments: materialized on the agent's machine so it can open them.
+      if (p === "/inbox" && req.method === "POST") {
+        const { name, data } = await readBody(req);
+        if (!name || !data) return json(res, 400, { error: "name and data required" });
+        const safe = basename(String(name));
+        const b64 = String(data).replace(/^data:[^;]*;base64,/, "");
+        await writeFile(join(INBOX, safe), Buffer.from(b64, "base64"));
+        return json(res, 200, { ok: true, path: join(INBOX, safe) });
       }
 
       if (p === "/ask" && req.method === "GET") return json(res, 200, { pending: pendingAsk() });
