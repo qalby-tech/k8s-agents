@@ -105,10 +105,53 @@ async function delegate({ agent, task }) {
     throw new Error(`agent "${agent}" rejected the task (status ${sent.status})`);
 
   return (
-    `Delegated to "${agent}" (session ${sessionId}). It is now working in its own ` +
-    `chat. Call check({ agent: "${agent}", session: "${sessionId}" }) to read its ` +
-    `progress and final result before reporting back.`
+    `Delegated to "${agent}" (session ${sessionId}). Now call ` +
+    `await_agent({ agent: "${agent}", session: "${sessionId}" }) — it waits and returns ` +
+    `when the agent finishes (or needs a human). Do NOT poll check() in a loop.`
   );
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// await_agent — block (server-side) until the delegated session finishes, OR the
+// agent pauses to ask a human (return early so the master can relay — otherwise
+// master waits for agent while agent waits for human = deadlock). One model call
+// replaces a polling loop of check()s.
+async function awaitAgent({ agent, session }) {
+  if (!agent || !session) throw new Error("await_agent requires { agent, session }");
+  const t = findTarget(agent);
+  if (!t) throw new Error(`unknown agent "${agent}"`);
+  const base = t.daemonURL.replace(/\/+$/, "");
+  const bridge = bridgeOf(t);
+  const deadline = Date.now() + 20 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const ask = await jfetch(`${bridge}/ask`).catch(() => null);
+    if (ask?.body?.pending)
+      return (
+        `⚠ "${agent}" PAUSED to ask the human: "${ask.body.pending.question}"\n` +
+        `Relay it (ask_human + answer_agent) or answer yourself if permitted, then await_agent again.`
+      );
+    const r = await jfetch(`${base}/session/${encodeURIComponent(session)}/message`).catch(() => null);
+    if (r?.ok && Array.isArray(r.body)) {
+      let last = null;
+      for (const m of r.body) if (((m.info || m).role || "") === "assistant") last = m;
+      if (last && (last.info || last).time?.completed) {
+        const text = (last.parts || [])
+          .filter((p) => p.type === "text" && p.text)
+          .map((p) => p.text)
+          .join("\n")
+          .trim();
+        const ob = await jfetch(`${bridge}/outbox`).catch(() => null);
+        const files = (ob?.body?.files || []).map((f) => f.name);
+        return (
+          `"${agent}" is DONE.\n\n${text || "(no text output)"}` +
+          (files.length ? `\n\nFiles it shared: ${files.join(", ")} — collect_file to surface them.` : "")
+        );
+      }
+    }
+    await sleep(4000);
+  }
+  return `"${agent}" is still working after 20 min — call await_agent again to keep waiting.`;
 }
 
 async function check({ agent, session }) {
@@ -230,10 +273,26 @@ const TOOLS = {
     },
     handler: delegate,
   },
+  await_agent: {
+    description:
+      "Wait for a delegated agent to finish. Blocks until the agent is DONE (returns its " +
+      "result + shared files) or PAUSES to ask a human (returns so you can relay/answer). " +
+      "Call this ONCE after delegate — do not poll check() in a loop.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent: { type: "string" },
+        session: { type: "string", description: "session id returned by delegate" },
+      },
+      required: ["agent", "session"],
+      additionalProperties: false,
+    },
+    handler: awaitAgent,
+  },
   check: {
     description:
-      "Read an agent's progress/result for a session started by delegate(). Poll until DONE. " +
-      "Also tells you if the agent is blocked asking a human, or has shared files.",
+      "Peek at an agent's progress once (non-blocking) — for a status glance. To WAIT for " +
+      "completion use await_agent, not a check loop. Also surfaces a blocked human-question / shared files.",
     inputSchema: {
       type: "object",
       properties: {
