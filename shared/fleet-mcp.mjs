@@ -13,9 +13,16 @@
 // Tools: list_agents, delegate(agent, task), check(agent, session).
 import { createInterface } from "node:readline";
 import { readFileSync } from "node:fs";
+import { mkdir, writeFile, readFile } from "node:fs/promises";
+import { join, basename } from "node:path";
 
 const TARGETS_PATH = process.env.FLEET_TARGETS || "/etc/aimaster/targets.json";
+const OUTBOX = process.env.AGENT_OUTBOX || "/workspace/outbox";
 const PROTOCOL_VERSION = "2024-11-05";
+
+// A slave's agent-bridge (:4097) sits next to its opencode API (:4096). That's
+// where its pending ask_human question and its shared files live.
+const bridgeOf = (t) => t.daemonURL.replace(/\/+$/, "").replace(/:4096$/, ":4097");
 
 function loadTargets() {
   try {
@@ -136,11 +143,68 @@ async function check({ agent, session }) {
     .join("\n")
     .trim();
   const status = running ? "WORKING" : done ? "DONE" : "WORKING";
+
+  // Out-of-band channels the slave can't put in its own transcript: a pending
+  // human question (it's blocked) and any files it shared. Surface them so the
+  // master can relay/answer and collect.
+  const bridge = bridgeOf(t);
+  let extra = "";
+  const ask = await jfetch(`${bridge}/ask`).catch(() => null);
+  if (ask?.body?.pending) {
+    extra +=
+      `\n\n⚠ "${agent}" IS WAITING ON A HUMAN. It asked: "${ask.body.pending.question}"\n` +
+      `Resolve it: relay to the user with ask_human and pass their reply back via ` +
+      `answer_agent({ agent: "${agent}", answer }), OR — only if you're permitted to ` +
+      `decide for the user — answer it yourself with answer_agent.`;
+  }
+  const ob = await jfetch(`${bridge}/outbox`).catch(() => null);
+  const files = (ob?.body?.files || []).map((f) => f.name);
+  if (files.length)
+    extra += `\n\nFiles "${agent}" shared: ${files.join(", ")}. Surface one to the user with collect_file({ agent: "${agent}", name }).`;
+
   return (
     `Agent "${agent}" — ${status}.\n\n` +
     (text || "(no text output yet)") +
-    (status === "WORKING" ? `\n\n(Call check again in a few seconds for more.)` : "")
+    (status === "WORKING" && !extra ? `\n\n(Call check again in a few seconds for more.)` : "") +
+    extra
   );
+}
+
+async function answerAgent({ agent, answer }) {
+  if (!agent || answer === undefined) throw new Error("answer_agent requires { agent, answer }");
+  const t = findTarget(agent);
+  if (!t) throw new Error(`unknown agent "${agent}"`);
+  const bridge = bridgeOf(t);
+  const ask = await jfetch(`${bridge}/ask`);
+  const pending = ask.body?.pending;
+  if (!pending) return `"${agent}" has no pending question right now (nothing to answer).`;
+  const r = await jfetch(`${bridge}/ask/answer`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ id: pending.id, answer: String(answer) }),
+  });
+  if (!r.ok) throw new Error(`could not deliver the answer to "${agent}" (status ${r.status})`);
+  return `Answered "${agent}"'s question ("${pending.question}") with: ${answer}`;
+}
+
+async function collectFile({ agent, name, caption }) {
+  if (!agent || !name) throw new Error("collect_file requires { agent, name }");
+  const t = findTarget(agent);
+  if (!t) throw new Error(`unknown agent "${agent}"`);
+  const safe = basename(String(name));
+  const r = await fetch(`${bridgeOf(t)}/outbox/${encodeURIComponent(safe)}`).catch(() => null);
+  if (!r || !r.ok) throw new Error(`could not fetch "${safe}" from "${agent}"`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  await mkdir(OUTBOX, { recursive: true }).catch(() => {});
+  await writeFile(join(OUTBOX, safe), buf);
+  if (caption) {
+    const cf = join(OUTBOX, ".captions.json");
+    let map = {};
+    try { map = JSON.parse(await readFile(cf, "utf8")); } catch {}
+    map[safe] = `from ${agent}: ${caption}`;
+    await writeFile(cf, JSON.stringify(map)).catch(() => {});
+  }
+  return `Collected "${safe}" from "${agent}" — it's now in this chat's attachments.`;
 }
 
 const TOOLS = {
@@ -168,7 +232,8 @@ const TOOLS = {
   },
   check: {
     description:
-      "Read an agent's progress/result for a session started by delegate(). Poll until DONE.",
+      "Read an agent's progress/result for a session started by delegate(). Poll until DONE. " +
+      "Also tells you if the agent is blocked asking a human, or has shared files.",
     inputSchema: {
       type: "object",
       properties: {
@@ -179,6 +244,38 @@ const TOOLS = {
       additionalProperties: false,
     },
     handler: check,
+  },
+  answer_agent: {
+    description:
+      "Deliver an answer to an agent that is blocked on a human question (check shows " +
+      "this). Use it to pass back the user's reply (relay), or your own decision if you " +
+      "are permitted to decide for the user.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent: { type: "string" },
+        answer: { type: "string", description: "the answer to unblock the agent with" },
+      },
+      required: ["agent", "answer"],
+      additionalProperties: false,
+    },
+    handler: answerAgent,
+  },
+  collect_file: {
+    description:
+      "Pull a file an agent shared (see check) into THIS chat's attachments so the user " +
+      "sees it here.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent: { type: "string" },
+        name: { type: "string", description: "the file name from check" },
+        caption: { type: "string" },
+      },
+      required: ["agent", "name"],
+      additionalProperties: false,
+    },
+    handler: collectFile,
   },
 };
 
