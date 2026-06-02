@@ -109,6 +109,42 @@ async function writeOutbox(session, name, b64, caption) {
   return join(dir, safe);
 }
 
+// ── busy probe: is opencode running a task right now, and in which session? ──
+let busyCache = null, busyAt = 0;
+async function busy() {
+  if (busyCache && Date.now() - busyAt < 2500) return busyCache;
+  let out = { busy: false, session: null };
+  try {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), 6000);
+    const sres = await fetch("http://127.0.0.1:4096/session", { signal: ac.signal });
+    const sessions = await sres.json();
+    clearTimeout(t);
+    const list = (Array.isArray(sessions) ? sessions : []).sort(
+      (a, b) => (b?.time?.updated || 0) - (a?.time?.updated || 0),
+    );
+    if (list.length) {
+      const sid = list[0].id;
+      const mres = await fetch(`http://127.0.0.1:4096/session/${sid}/message`);
+      const msgs = await mres.json();
+      let lastRole = "", lastAssistantDone = true, running = false;
+      for (const m of Array.isArray(msgs) ? msgs : []) {
+        const info = m.info || m;
+        lastRole = info.role || lastRole;
+        if ((info.role || "") === "assistant") lastAssistantDone = !!info?.time?.completed;
+        for (const p of m.parts || [])
+          if (p.type === "tool" && p.state && (p.state.status === "running" || p.state.status === "pending")) running = true;
+      }
+      out = { busy: running || lastRole === "user" || !lastAssistantDone, session: sid };
+    }
+  } catch {
+    /* opencode busy/unreachable → report not busy */
+  }
+  busyCache = out;
+  busyAt = Date.now();
+  return out;
+}
+
 // ── ask-human (global; transient) ────────────────────────────────────────────
 const asks = new Map();
 let askSeq = 0;
@@ -135,6 +171,7 @@ http
     const p = u.pathname;
     try {
       if (p === "/status" || p === "/" || p === "/healthz") return json(res, 200, await getStatus());
+      if (p === "/busy" && req.method === "GET") return json(res, 200, await busy());
 
       if (p === "/session/active" && req.method === "POST") {
         const { session } = await readBody(req);
