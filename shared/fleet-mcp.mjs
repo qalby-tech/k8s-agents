@@ -13,11 +13,10 @@
 // Tools: list_agents, delegate(agent, task), check(agent, session).
 import { createInterface } from "node:readline";
 import { readFileSync } from "node:fs";
-import { mkdir, writeFile, readFile } from "node:fs/promises";
-import { join, basename } from "node:path";
+import { basename } from "node:path";
 
 const TARGETS_PATH = process.env.FLEET_TARGETS || "/etc/aimaster/targets.json";
-const OUTBOX = process.env.AGENT_OUTBOX || "/workspace/outbox";
+const BRIDGE = process.env.AGENT_BRIDGE || "http://127.0.0.1:4097"; // the master's own bridge
 const PROTOCOL_VERSION = "2024-11-05";
 
 // A slave's agent-bridge (:4097) sits next to its opencode API (:4096). That's
@@ -235,18 +234,17 @@ async function collectFile({ agent, name, caption }) {
   const t = findTarget(agent);
   if (!t) throw new Error(`unknown agent "${agent}"`);
   const safe = basename(String(name));
+  // Fetch from the slave's active session outbox, then post to OUR active
+  // session outbox (this master chat) so it shows here.
   const r = await fetch(`${bridgeOf(t)}/outbox/${encodeURIComponent(safe)}`).catch(() => null);
   if (!r || !r.ok) throw new Error(`could not fetch "${safe}" from "${agent}"`);
-  const buf = Buffer.from(await r.arrayBuffer());
-  await mkdir(OUTBOX, { recursive: true }).catch(() => {});
-  await writeFile(join(OUTBOX, safe), buf);
-  if (caption) {
-    const cf = join(OUTBOX, ".captions.json");
-    let map = {};
-    try { map = JSON.parse(await readFile(cf, "utf8")); } catch {}
-    map[safe] = `from ${agent}: ${caption}`;
-    await writeFile(cf, JSON.stringify(map)).catch(() => {});
-  }
+  const b64 = Buffer.from(await r.arrayBuffer()).toString("base64");
+  const post = await jfetch(`${BRIDGE}/outbox`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: safe, data: b64, caption: `from ${agent}${caption ? `: ${caption}` : ""}` }),
+  });
+  if (!post.ok) throw new Error(`could not surface "${safe}" (status ${post.status})`);
   return `Collected "${safe}" from "${agent}" — it's now in this chat's attachments.`;
 }
 

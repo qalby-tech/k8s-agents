@@ -1,47 +1,54 @@
-// agent-bridge — the AI daemon/master's local HTTP server on :4097. Three jobs:
+// agent-bridge — the AI daemon/master's local HTTP server on :4097.
 //
-//   GET  /status            guest status (daemon only): SSH key-auth / cloud-init
-//                           / cua. The master returns a minimal {online:true}.
-//   GET  /outbox            files the agent shared with the user (in /workspace
-//   GET  /outbox/<name>     /outbox) — agent → chat attachments.
-//   GET  /ask               the pending human question (or null)
-//   POST /ask               { question } -> { id } (called by the ask_human MCP tool)
-//   GET  /ask/wait?id=      long-poll: { answered, answer } (the MCP tool blocks here)
-//   POST /ask/answer        { id, answer } (the chat UI answers)
+//   GET  /status                 guest status (daemon): SSH key-auth/cloud-init/cua.
+//                                master returns minimal {online:true}.
+//   POST /session/active         { session } — the chat tells us which session is
+//                                active, so files an MCP tool writes get scoped to it
+//                                (tools can't know their own opencode session).
+//   GET  /outbox?session=<id>    files the agent shared in that session
+//   GET  /outbox/<id>/<name>     fetch one
+//   DELETE /outbox/<id>/<name>   remove one (chat "remove" button)
+//   POST /outbox                 { name, data, caption } — an MCP tool shares a file
+//                                into the ACTIVE session's outbox
+//   POST /inbox                  { name, data, session } — a user attachment, saved
+//                                so the agent can open it
+//   GET  /ask | POST /ask | GET /ask/wait | POST /ask/answer   — ask_human (global)
 //
-// tenant-api proxies this; the chat polls it. Everything reuses the daemon's own
-// ~/.ssh (Host vm) for the SSH probes — the same hop the agent uses.
+// Attachments are per-session dirs (outbox/<session>, inbox/<session>); another
+// session can still read them by path on disk.
 import http from "node:http";
 import { execFile } from "node:child_process";
-import { readFile, readdir, stat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { readFile, readdir, stat, mkdir, unlink, writeFile, rm } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { join, basename, extname } from "node:path";
 
 const PORT = 4097;
 const OUTBOX = process.env.AGENT_OUTBOX || "/workspace/outbox";
-// Files the USER attaches in the chat, materialized so the agent can open them
-// (a PDF the model can't read is still readable here with tools).
 const INBOX = process.env.AGENT_INBOX || "/workspace/inbox";
-// Master mode has no VM (no /etc/aidaemon/vm_user); skip the SSH probes there.
 const IS_DAEMON = await readFile("/etc/aidaemon/vm_user", "utf8").then(() => true).catch(() => false);
 const GUI = await readFile("/etc/aidaemon/vm_gui", "utf8").then((s) => s.trim() === "true").catch(() => false);
 
 await mkdir(OUTBOX, { recursive: true }).catch(() => {});
 await mkdir(INBOX, { recursive: true }).catch(() => {});
 
+// Which opencode session is in front right now (set by the chat). MCP tools
+// write to this session's outbox. Defaults so a stray write isn't lost.
+let activeSession = "default";
+const sess = (s) => (s ? basename(String(s)) : activeSession) || "default";
+const outDir = (s) => join(OUTBOX, sess(s));
+const inDir = (s) => join(INBOX, sess(s));
+
+// ── daemon guest status (unchanged) ──────────────────────────────────────────
 function sh(cmd, args, timeoutMs = 8000) {
   return new Promise((resolve) => {
     execFile(cmd, args, { timeout: timeoutMs }, (err, stdout) => resolve({ ok: !err, out: (stdout || "").trim() }));
   });
 }
 const ssh = (remote) => sh("ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "vm", remote]);
-
 async function probe() {
   if (!IS_DAEMON) return { online: true, master: true, ts: Date.now() };
   const sshOk = (await ssh("true")).ok;
-  let cloudInit = "unknown",
-    cuaInstalled = false,
-    cuaActive = false;
+  let cloudInit = "unknown", cuaInstalled = false, cuaActive = false;
   if (sshOk) {
     cloudInit = (await ssh("cloud-init status 2>/dev/null | sed -n 's/^status: //p'")).out || "done";
     if (GUI) {
@@ -52,12 +59,9 @@ async function probe() {
   }
   const bootstrapStatus = await readFile("/tmp/agent-bootstrap.status", "utf8").then((s) => s.trim()).catch(() => "");
   const bootstrapTail = await readFile("/tmp/agent-bootstrap.log", "utf8")
-    .then((s) => s.trim().split("\n").slice(-3).join("\n"))
-    .catch(() => "");
+    .then((s) => s.trim().split("\n").slice(-3).join("\n")).catch(() => "");
   return { gui: GUI, sshOk, cloudInit, cuaInstalled, cuaActive, bootstrapStatus, bootstrapTail, ts: Date.now() };
 }
-
-// Cache + single-flight so polling doesn't spawn an SSH storm.
 let cache = null, cacheAt = 0, inflight = null;
 function getStatus() {
   if (cache && Date.now() - cacheAt < 4000) return Promise.resolve(cache);
@@ -77,22 +81,36 @@ const MIME = {
 };
 const mimeOf = (name) => MIME[extname(name).toLowerCase()] || "application/octet-stream";
 
-async function listOutbox() {
-  const names = await readdir(OUTBOX).catch(() => []);
-  const captions = await readFile(join(OUTBOX, ".captions.json"), "utf8").then((s) => JSON.parse(s)).catch(() => ({}));
+async function listOutbox(session) {
+  const dir = outDir(session);
+  const names = await readdir(dir).catch(() => []);
+  const captions = await readFile(join(dir, ".captions.json"), "utf8").then((s) => JSON.parse(s)).catch(() => ({}));
   const out = [];
   for (const name of names) {
     if (name.startsWith(".")) continue;
-    const st = await stat(join(OUTBOX, name)).catch(() => null);
+    const st = await stat(join(dir, name)).catch(() => null);
     if (!st || !st.isFile()) continue;
     out.push({ name, size: st.size, mime: mimeOf(name), mtime: st.mtimeMs, caption: captions[name] || "" });
   }
-  out.sort((a, b) => b.mtime - a.mtime);
+  out.sort((a, b) => a.mtime - b.mtime); // chronological — they render inline in order
   return out;
 }
+async function writeOutbox(session, name, b64, caption) {
+  const dir = outDir(session);
+  await mkdir(dir, { recursive: true }).catch(() => {});
+  const safe = basename(name);
+  await writeFile(join(dir, safe), Buffer.from(String(b64).replace(/^data:[^;]*;base64,/, ""), "base64"));
+  if (caption) {
+    const cf = join(dir, ".captions.json");
+    const map = await readFile(cf, "utf8").then((s) => JSON.parse(s)).catch(() => ({}));
+    map[safe] = String(caption);
+    await writeFile(cf, JSON.stringify(map)).catch(() => {});
+  }
+  return join(dir, safe);
+}
 
-// ── ask-human state (single pending question at a time is enough) ────────────
-const asks = new Map(); // id -> { question, answer, ts }
+// ── ask-human (global; transient) ────────────────────────────────────────────
+const asks = new Map();
 let askSeq = 0;
 const pendingAsk = () => {
   for (const [id, a] of asks) if (a.answer === undefined) return { id, question: a.question, ts: a.ts };
@@ -118,32 +136,44 @@ http
     try {
       if (p === "/status" || p === "/" || p === "/healthz") return json(res, 200, await getStatus());
 
-      if (p === "/outbox" && req.method === "GET") return json(res, 200, { files: await listOutbox() });
-      if (p.startsWith("/outbox/") && req.method === "GET") {
-        const name = basename(decodeURIComponent(p.slice("/outbox/".length)));
-        const full = join(OUTBOX, name);
+      if (p === "/session/active" && req.method === "POST") {
+        const { session } = await readBody(req);
+        if (session) activeSession = basename(String(session));
+        return json(res, 200, { ok: true, active: activeSession });
+      }
+
+      if (p === "/outbox" && req.method === "GET")
+        return json(res, 200, { files: await listOutbox(u.searchParams.get("session")) });
+      // /outbox/<session>/<name>  or  /outbox/<name> (then the active session)
+      if (p.startsWith("/outbox/")) {
+        const segs = p.slice("/outbox/".length).split("/").filter(Boolean).map(decodeURIComponent);
+        const session = segs.length >= 2 ? segs[0] : activeSession;
+        const name = basename(segs.length >= 2 ? segs.slice(1).join("/") : segs[0] || "");
+        const full = join(OUTBOX, sess(session), name);
+        if (req.method === "DELETE") {
+          await unlink(full).catch(() => {});
+          return json(res, 200, { ok: true });
+        }
         const st = await stat(full).catch(() => null);
         if (!st || !st.isFile()) return json(res, 404, { error: "not found" });
         res.writeHead(200, { "content-type": mimeOf(name), "content-length": st.size, "cache-control": "no-store" });
         return createReadStream(full).pipe(res);
       }
-      // The chat's "remove" button — let the user clear a shared file.
-      if (p.startsWith("/outbox/") && req.method === "DELETE") {
-        const name = basename(decodeURIComponent(p.slice("/outbox/".length)));
-        await unlink(join(OUTBOX, name)).catch(() => {});
-        const cf = join(OUTBOX, ".captions.json");
-        const map = await readFile(cf, "utf8").then((s) => JSON.parse(s)).catch(() => ({}));
-        if (map[name]) { delete map[name]; await writeFile(cf, JSON.stringify(map)).catch(() => {}); }
-        return json(res, 200, { ok: true });
-      }
-      // User attachments: materialized on the agent's machine so it can open them.
-      if (p === "/inbox" && req.method === "POST") {
-        const { name, data } = await readBody(req);
+      if (p === "/outbox" && req.method === "POST") {
+        const { name, data, caption, session } = await readBody(req);
         if (!name || !data) return json(res, 400, { error: "name and data required" });
+        const path = await writeOutbox(session || activeSession, name, data, caption);
+        return json(res, 200, { ok: true, path, session: sess(session) });
+      }
+
+      if (p === "/inbox" && req.method === "POST") {
+        const { name, data, session } = await readBody(req);
+        if (!name || !data) return json(res, 400, { error: "name and data required" });
+        const dir = inDir(session);
+        await mkdir(dir, { recursive: true }).catch(() => {});
         const safe = basename(String(name));
-        const b64 = String(data).replace(/^data:[^;]*;base64,/, "");
-        await writeFile(join(INBOX, safe), Buffer.from(b64, "base64"));
-        return json(res, 200, { ok: true, path: join(INBOX, safe) });
+        await writeFile(join(dir, safe), Buffer.from(String(data).replace(/^data:[^;]*;base64,/, ""), "base64"));
+        return json(res, 200, { ok: true, path: join(dir, safe) });
       }
 
       if (p === "/ask" && req.method === "GET") return json(res, 200, { pending: pendingAsk() });
@@ -158,8 +188,6 @@ http
         const id = u.searchParams.get("id");
         const a = asks.get(id);
         if (!a) return json(res, 404, { error: "unknown id" });
-        // short long-poll: resolve as soon as answered, else time out so the
-        // client re-polls (keeps the MCP tool responsive without a hung socket).
         const deadline = Date.now() + 25000;
         const tick = () => {
           const cur = asks.get(id);

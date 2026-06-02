@@ -14,12 +14,11 @@
 // never exfiltrate the daemon's secrets (SSH key, vm_password, provider auth.json).
 import { createInterface } from "node:readline";
 import { execFile } from "node:child_process";
-import { readFile, copyFile, unlink, mkdir, realpath, stat, writeFile } from "node:fs/promises";
+import { readFile, unlink, realpath, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join, basename } from "node:path";
+import { basename } from "node:path";
 
 const BRIDGE = process.env.AGENT_BRIDGE || "http://127.0.0.1:4097";
-const OUTBOX = process.env.AGENT_OUTBOX || "/workspace/outbox";
 const PROTOCOL_VERSION = "2024-11-05";
 const ASK_TIMEOUT_MS = 15 * 60 * 1000;
 // Daemon (has a VM) vs master. The screenshot tool only exists on a daemon.
@@ -71,35 +70,38 @@ async function askHuman({ question }) {
   return "No answer from the human within 15 minutes — use your best judgement, or ask again if essential.";
 }
 
-async function recordCaption(name, caption) {
-  if (!caption) return;
-  const file = join(OUTBOX, ".captions.json");
-  let map = {};
-  try { map = JSON.parse(await readFile(file, "utf8")); } catch {}
-  map[name] = String(caption);
-  await writeFile(file, JSON.stringify(map)).catch(() => {});
+// Hand a file to the bridge, which files it under the ACTIVE session's outbox
+// (the chat then shows it inline in that session). The bridge knows the session;
+// the MCP tool can't.
+async function postOutbox(name, b64, caption) {
+  const r = await jfetch(`${BRIDGE}/outbox`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name, data: b64, caption: caption || "" }),
+  });
+  if (!r.ok) throw new Error(`could not share the file (status ${r.status})`);
 }
 
 async function shareFile({ path, caption, from }) {
   if (!path) throw new Error("share_file requires { path }");
-  await mkdir(OUTBOX, { recursive: true }).catch(() => {});
   const name = basename(String(path)) || "file";
-  const dest = join(OUTBOX, name);
+  let b64;
   if (from === "vm") {
     if (!IS_DAEMON) throw new Error("from:'vm' is only available on a VM daemon");
-    // Pulls from the user's own VM — no pod secrets involved. fleet handles SSH.
-    await run("fleet", ["pull", "vm", String(path), dest]);
+    const tmp = `/tmp/mcp-share-${Date.now()}-${name}`;
+    await run("fleet", ["pull", "vm", String(path), tmp]); // from the user's own VM
+    b64 = (await readFile(tmp)).toString("base64");
+    await unlink(tmp).catch(() => {});
   } else {
     // Local pod file: must resolve inside the allowlist (blocks secrets/keys).
     let real;
     try { real = await realpath(String(path)); } catch { throw new Error(`no such file: ${path}`); }
     if (!SHARE_ROOTS.some((root) => real === root || real.startsWith(root + "/")))
       throw new Error("share_file (local) only allows files under /workspace or /tmp");
-    const st = await stat(real);
-    if (!st.isFile()) throw new Error("not a regular file");
-    await copyFile(real, dest);
+    if (!(await stat(real)).isFile()) throw new Error("not a regular file");
+    b64 = (await readFile(real)).toString("base64");
   }
-  await recordCaption(name, caption);
+  await postOutbox(name, b64, caption);
   return `Shared "${name}" with the user — it's in the chat's attachments.${caption ? ` (${caption})` : ""}`;
 }
 
@@ -109,14 +111,13 @@ async function screenshot() {
   // Reuse the fleet CLI (cua /cmd over SSH + decode) — same capability the agent
   // already has; this just returns the bytes as a native image to the model.
   await run("fleet", ["screenshot", "vm", tmp], 60000);
-  const buf = await readFile(tmp);
-  await mkdir(OUTBOX, { recursive: true }).catch(() => {});
-  await copyFile(tmp, join(OUTBOX, "screen.png")).catch(() => {}); // so the user sees it too
+  const b64 = (await readFile(tmp)).toString("base64");
   await unlink(tmp).catch(() => {});
+  await postOutbox("screen.png", b64, "screenshot").catch(() => {}); // so the user sees it inline
   return {
     content: [
-      { type: "text", text: "Screenshot of the VM (saved to /workspace/outbox/screen.png). If your model is text-only, run analyze_image on that path instead." },
-      { type: "image", data: buf.toString("base64"), mimeType: "image/png" },
+      { type: "text", text: "Screenshot of the VM (also shown in the chat). If your model is text-only, run analyze_image on /workspace/inbox or ask for a vision model." },
+      { type: "image", data: b64, mimeType: "image/png" },
     ],
   };
 }
