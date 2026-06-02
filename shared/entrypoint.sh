@@ -23,54 +23,35 @@ fi
 # agent hangs waiting for an approval that never arrives. Add the zai vision MCP
 # server when the chosen provider has it enabled; the key is inlined from the
 # mounted auth.json (tenant-api cannot read the Secret back to render it).
-mkdir -p /root/.config/opencode
+mkdir -p /root/.config/opencode /workspace/outbox
+
+# Compose the MCP block. The "bridge" server (ask_human + the outbox the chat
+# shows as attachments) is loaded in BOTH roles. On top of it: "fleet" for a
+# master (drive slave daemons) or the zai vision MCP for a daemon (when on).
+BRIDGE_MCP='"bridge": { "type": "local", "command": ["node", "/usr/local/bin/bridge-mcp.mjs"] }'
 if [ -f /etc/aimaster/targets.json ]; then
-  # AI Master mode: no VM. Orchestrate the attached slave daemons through the
-  # fleet MCP server, which drives each slave's own opencode API over HTTP.
-  cat > /root/.config/opencode/opencode.jsonc <<EOF
-{
-  "\$schema": "https://opencode.ai/config.json",
-  "permission": { "*": "allow" },
-  "mcp": {
-    "fleet": {
-      "type": "local",
-      "command": ["node", "/usr/local/bin/fleet-mcp.mjs"],
-      "environment": { "FLEET_TARGETS": "/etc/aimaster/targets.json" }
-    }
-  }
-}
-EOF
+  EXTRA_MCP='"fleet": { "type": "local", "command": ["node", "/usr/local/bin/fleet-mcp.mjs"], "environment": { "FLEET_TARGETS": "/etc/aimaster/targets.json" } }'
 elif [ -f /etc/aidaemon/mcp_vision ] && [ -n "${Z_AI_API_KEY:-}" ]; then
-  cat > /root/.config/opencode/opencode.jsonc <<EOF
+  EXTRA_MCP='"zai-mcp-server": { "type": "local", "command": ["npx", "-y", "@z_ai/mcp-server"], "environment": { "Z_AI_API_KEY": "'"${Z_AI_API_KEY}"'", "Z_AI_MODE": "ZAI" } }'
+else
+  EXTRA_MCP=''
+fi
+if [ -n "$EXTRA_MCP" ]; then MCP="$BRIDGE_MCP, $EXTRA_MCP"; else MCP="$BRIDGE_MCP"; fi
+cat > /root/.config/opencode/opencode.jsonc <<EOF
 {
   "\$schema": "https://opencode.ai/config.json",
   "permission": { "*": "allow" },
-  "mcp": {
-    "zai-mcp-server": {
-      "type": "local",
-      "command": ["npx", "-y", "@z_ai/mcp-server"],
-      "environment": {
-        "Z_AI_API_KEY": "${Z_AI_API_KEY}",
-        "Z_AI_MODE": "ZAI"
-      }
-    }
-  }
+  "mcp": { $MCP }
 }
 EOF
-else
-  cat > /root/.config/opencode/opencode.jsonc <<EOF
-{
-  "\$schema": "https://opencode.ai/config.json",
-  "permission": { "*": "allow" }
-}
-EOF
-fi
+
+# agent-bridge on :4097 — status (daemon), the outbox attachments tray, and the
+# ask_human pending-question store. Runs in both roles.
+node /usr/local/bin/status-server.mjs >/tmp/status-server.log 2>&1 &
 
 if [ -f /etc/aidaemon/vm_user ]; then
   echo "[entrypoint] AI daemon mode — bootstrapping VM in background"
   agent-bootstrap >/tmp/agent-bootstrap.log 2>&1 &
-  # Guest-status endpoint on :4097 (cloud-init / cua / key-auth) for the UI.
-  node /usr/local/bin/status-server.mjs >/tmp/status-server.log 2>&1 &
 fi
 
 exec opencode serve --hostname 0.0.0.0 --port 4096

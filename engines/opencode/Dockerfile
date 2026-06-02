@@ -23,6 +23,8 @@ COPY shared/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY shared/status-server.mjs /usr/local/bin/status-server.mjs
 # fleet-mcp: AI Master orchestration tools (delegate to slave daemons over HTTP).
 COPY shared/fleet-mcp.mjs /usr/local/bin/fleet-mcp.mjs
+# bridge-mcp: ask_human tool (both roles), talks to the agent-bridge on :4097.
+COPY shared/bridge-mcp.mjs /usr/local/bin/bridge-mcp.mjs
 RUN chmod +x /usr/local/bin/fleet /usr/local/bin/agent-bootstrap /usr/local/bin/entrypoint.sh
 
 WORKDIR /workspace
