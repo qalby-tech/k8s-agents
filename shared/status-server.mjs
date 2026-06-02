@@ -109,11 +109,38 @@ async function writeOutbox(session, name, b64, caption) {
   return join(dir, safe);
 }
 
-// ── busy probe: is opencode running a task right now, and in which session? ──
+// ── busy probe: which sessions are running a task right now? ──────────────────
+// The chat marks a session-dot green only when that exact session is running, so
+// we must report EVERY running session (a master can drive several in parallel),
+// not just the most-recent one. We also return each running session's title so
+// the graph can annotate the master→agent edge with the task in flight.
+//
+// Cost control: a session that hasn't been touched in a while can't be running,
+// so we only inspect sessions updated within ACTIVE_WINDOW (and cap the count).
+// Running sessions stream updates continuously, so they always stay in-window.
 let busyCache = null, busyAt = 0;
+const ACTIVE_WINDOW = 10 * 60 * 1000; // 10 min
+const MAX_PROBE = 16;
+async function sessionRunning(sid) {
+  try {
+    const mres = await fetch(`http://127.0.0.1:4096/session/${sid}/message`);
+    const msgs = await mres.json();
+    let lastRole = "", lastAssistantDone = true, running = false;
+    for (const m of Array.isArray(msgs) ? msgs : []) {
+      const info = m.info || m;
+      lastRole = info.role || lastRole;
+      if ((info.role || "") === "assistant") lastAssistantDone = !!info?.time?.completed;
+      for (const p of m.parts || [])
+        if (p.type === "tool" && p.state && (p.state.status === "running" || p.state.status === "pending")) running = true;
+    }
+    return running || lastRole === "user" || !lastAssistantDone;
+  } catch {
+    return false;
+  }
+}
 async function busy() {
   if (busyCache && Date.now() - busyAt < 2500) return busyCache;
-  let out = { busy: false, session: null };
+  let out = { busy: false, session: null, sessions: [], tasks: {} };
   try {
     const ac = new AbortController();
     const t = setTimeout(() => ac.abort(), 6000);
@@ -123,20 +150,30 @@ async function busy() {
     const list = (Array.isArray(sessions) ? sessions : []).sort(
       (a, b) => (b?.time?.updated || 0) - (a?.time?.updated || 0),
     );
-    if (list.length) {
-      const sid = list[0].id;
-      const mres = await fetch(`http://127.0.0.1:4096/session/${sid}/message`);
-      const msgs = await mres.json();
-      let lastRole = "", lastAssistantDone = true, running = false;
-      for (const m of Array.isArray(msgs) ? msgs : []) {
-        const info = m.info || m;
-        lastRole = info.role || lastRole;
-        if ((info.role || "") === "assistant") lastAssistantDone = !!info?.time?.completed;
-        for (const p of m.parts || [])
-          if (p.type === "tool" && p.state && (p.state.status === "running" || p.state.status === "pending")) running = true;
-      }
-      out = { busy: running || lastRole === "user" || !lastAssistantDone, session: sid };
-    }
+    const now = Date.now();
+    const candidates = list
+      .filter((s) => s?.id && now - (s?.time?.updated || 0) < ACTIVE_WINDOW)
+      .slice(0, MAX_PROBE);
+    const running = [];
+    const tasks = {};
+    await Promise.all(
+      candidates.map(async (s) => {
+        if (await sessionRunning(s.id)) {
+          running.push(s.id);
+          tasks[s.id] = (s.title || "").trim();
+        }
+      }),
+    );
+    // back-compat `session`: most-recently-updated running one (candidates are
+    // already sorted desc), else the latest session overall.
+    const runSet = new Set(running);
+    const newestRunning = candidates.find((s) => runSet.has(s.id))?.id;
+    out = {
+      busy: running.length > 0,
+      session: newestRunning || list[0]?.id || null,
+      sessions: running,
+      tasks,
+    };
   } catch {
     /* opencode busy/unreachable → report not busy */
   }
