@@ -75,12 +75,13 @@ const mimeOf = (name) => MIME[extname(name).toLowerCase()] || "application/octet
 
 async function listOutbox() {
   const names = await readdir(OUTBOX).catch(() => []);
+  const captions = await readFile(join(OUTBOX, ".captions.json"), "utf8").then((s) => JSON.parse(s)).catch(() => ({}));
   const out = [];
   for (const name of names) {
     if (name.startsWith(".")) continue;
     const st = await stat(join(OUTBOX, name)).catch(() => null);
     if (!st || !st.isFile()) continue;
-    out.push({ name, size: st.size, mime: mimeOf(name), mtime: st.mtimeMs });
+    out.push({ name, size: st.size, mime: mimeOf(name), mtime: st.mtimeMs, caption: captions[name] || "" });
   }
   out.sort((a, b) => b.mtime - a.mtime);
   return out;
