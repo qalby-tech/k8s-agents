@@ -182,6 +182,138 @@ async function busy() {
   return out;
 }
 
+// ── delegated-agent watches (master only): wake the master on completion ──────
+// When the master delegates a task, fleet-mcp POSTs /watch here. We poll the
+// slave's session and, when it finishes (or errors / blocks on a human / stalls),
+// we inject a USER message into the MASTER's OWN opencode session via
+// /session/<id>/prompt_async — so the master is re-prompted to evaluate the
+// result even though it already ended its turn. This replaces the old blocking
+// await_agent (a 20-min tool call that hung / showed as broken). The session we
+// wake is whatever was active when the watch was registered (the master's chat).
+const watches = new Map();
+let watchSeq = 0;
+const WATCH_MAX_MS = 30 * 60 * 1000; // give up (call it "stuck") after this
+const WATCH_POLL_MS = 5000;
+const WATCH_MAX_FAILS = 60; // ~5 min of unreachable slave -> "broken"
+
+async function fetchJson(url, opts, timeoutMs = 8000) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { ...opts, signal: ac.signal });
+    const text = await r.text();
+    let body;
+    try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+    return { ok: r.ok, status: r.status, body };
+  } catch {
+    return { ok: false, status: 0, body: null };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Reduce a slave's message list to {done, text, error}. "done" means the last
+// assistant message finished AND no tool is still running.
+function inspectSession(msgs) {
+  let last = null, running = false;
+  for (const m of Array.isArray(msgs) ? msgs : []) {
+    const info = m.info || m;
+    if ((info.role || "") === "assistant") last = m;
+    for (const p of m.parts || [])
+      if (p.type === "tool" && p.state && (p.state.status === "running" || p.state.status === "pending")) running = true;
+  }
+  if (!last) return { done: false, text: "", error: null };
+  const info = last.info || last;
+  const text = (last.parts || []).filter((p) => p.type === "text" && p.text).map((p) => p.text).join("\n").trim();
+  const error = info?.error ? (info.error.message || info.error.name || JSON.stringify(info.error)) : null;
+  return { done: !!info?.time?.completed && !running, text, error };
+}
+
+// Inject a user message into the master's own session. Skip while that session
+// is already running so we never interrupt the master mid-turn or race two wakes
+// — we just retry on the next tick. Returns true only if the message landed.
+async function wakeMaster(masterSession, text) {
+  if (await sessionRunning(masterSession)) return false;
+  const r = await fetchJson(
+    `http://127.0.0.1:4096/session/${encodeURIComponent(masterSession)}/prompt_async`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ parts: [{ type: "text", text }] }) },
+  );
+  return r.ok;
+}
+
+// Returns true if it injected a wake this pass (so the caller stops for this tick
+// — one wake at a time, to let the master actually start before the next).
+async function processWatch(w) {
+  // 1) Blocked on a human? Wake once per distinct question so the master relays.
+  const ask = await fetchJson(`${w.slaveBridge}/ask`);
+  const q = ask.body?.pending?.question;
+  if (q && w.lastAsk !== q) {
+    const woke = await wakeMaster(
+      w.masterSession,
+      `[fleet] Agent "${w.agent}" is BLOCKED waiting on a human while doing the task you delegated ("${w.task}").\n` +
+        `It asked: "${q}"\n\n` +
+        `Relay it to the user with ask_human and pass the reply via answer_agent({ agent: "${w.agent}", answer }), ` +
+        `or answer it yourself with answer_agent if you're permitted to decide. You'll be notified again when it finishes.`,
+    );
+    if (woke) { w.lastAsk = q; return true; }
+    return false;
+  }
+
+  // 2) Finished (or ended on an error)?
+  const r = await fetchJson(`${w.slaveBase}/session/${encodeURIComponent(w.session)}/message`);
+  if (r.ok) {
+    w.fails = 0;
+    const s = inspectSession(r.body);
+    if (s.done) {
+      let text;
+      if (s.error) {
+        text =
+          `[fleet] Agent "${w.agent}" ENDED WITH AN ERROR on the task you delegated ("${w.task}"):\n${s.error}\n\n` +
+          `Decide how to handle it — re-delegate, or tell the user what failed.`;
+      } else {
+        const ob = await fetchJson(`${w.slaveBridge}/outbox`);
+        const files = (ob.body?.files || []).map((f) => f.name);
+        text =
+          `[fleet] Agent "${w.agent}" FINISHED the task you delegated ("${w.task}").\n\nIts result:\n${s.text || "(no text output)"}` +
+          (files.length ? `\n\nIt shared files: ${files.join(", ")} — surface any with collect_file({ agent: "${w.agent}", name }).` : "") +
+          `\n\nEvaluate this and continue: aggregate it for the user, delegate follow-up work, or report back. ` +
+          `(You were woken automatically — you did not need to wait.)`;
+      }
+      if (await wakeMaster(w.masterSession, text)) { watches.delete(w.id); return true; }
+      return false; // master busy — retry next tick
+    }
+  } else {
+    w.fails = (w.fails || 0) + 1;
+  }
+
+  // 3) Stalled or its daemon went unreachable — notify once and give up.
+  if (Date.now() - w.startedAt > WATCH_MAX_MS || w.fails > WATCH_MAX_FAILS) {
+    const reason = w.fails > WATCH_MAX_FAILS ? "its daemon has been unreachable for several minutes" : "it produced no result for 30 min and may be stuck";
+    await wakeMaster(
+      w.masterSession,
+      `[fleet] Agent "${w.agent}" did NOT finish the task you delegated ("${w.task}") — ${reason}.\n\n` +
+        `Look with check({ agent: "${w.agent}", session: "${w.session}" }), re-delegate, or tell the user.`,
+    );
+    watches.delete(w.id); // give up regardless of whether the wake landed
+    return true;
+  }
+  return false;
+}
+
+let watchBusy = false;
+async function watchTick() {
+  if (watchBusy || watches.size === 0) return;
+  watchBusy = true;
+  try {
+    for (const w of [...watches.values()]) {
+      if (await processWatch(w).catch(() => false)) break; // one wake per tick
+    }
+  } finally {
+    watchBusy = false;
+  }
+}
+if (!IS_DAEMON) setInterval(watchTick, WATCH_POLL_MS); // masters only
+
 // ── ask-human (global; transient) ────────────────────────────────────────────
 const asks = new Map();
 let askSeq = 0;
@@ -214,6 +346,28 @@ http
         const { session } = await readBody(req);
         if (session) activeSession = basename(String(session));
         return json(res, 200, { ok: true, active: activeSession });
+      }
+
+      // fleet-mcp's delegate() registers a watch so we wake the master when the
+      // delegated agent finishes. masterSession = whoever is active right now
+      // (the master chat that ran delegate). Master-side only.
+      if (p === "/watch" && req.method === "POST") {
+        const { slaveBase, slaveBridge, session, agent, task } = await readBody(req);
+        if (!slaveBase || !session) return json(res, 400, { error: "slaveBase and session required" });
+        const id = `w${++watchSeq}`;
+        watches.set(id, {
+          id,
+          slaveBase: String(slaveBase).replace(/\/+$/, ""),
+          slaveBridge: String(slaveBridge || "").replace(/\/+$/, ""),
+          session: String(session),
+          agent: String(agent || "agent"),
+          task: String(task || "").replace(/\s+/g, " ").trim().slice(0, 200),
+          masterSession: activeSession,
+          startedAt: Date.now(),
+          fails: 0,
+          lastAsk: null,
+        });
+        return json(res, 200, { ok: true, id, masterSession: activeSession });
       }
 
       if (p === "/outbox" && req.method === "GET")

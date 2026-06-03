@@ -103,54 +103,40 @@ async function delegate({ agent, task }) {
   if (!sent.ok)
     throw new Error(`agent "${agent}" rejected the task (status ${sent.status})`);
 
+  // Register an async watch with our own bridge: when this agent finishes (or
+  // errors / blocks on a human / stalls), the bridge injects a user message back
+  // into THIS master chat so we're re-prompted to evaluate it — no blocking wait.
+  const watch = await jfetch(`${BRIDGE}/watch`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ slaveBase: base, slaveBridge: bridgeOf(t), session: sessionId, agent, task }),
+  }).catch(() => null);
+
+  const armed = watch?.ok && watch.body?.ok;
   return (
-    `Delegated to "${agent}" (session ${sessionId}). Now call ` +
-    `await_agent({ agent: "${agent}", session: "${sessionId}" }) — it waits and returns ` +
-    `when the agent finishes (or needs a human). Do NOT poll check() in a loop.`
+    `Delegated to "${agent}" (session ${sessionId}). It's now working in its own chat.\n\n` +
+    (armed
+      ? `You will be AUTOMATICALLY notified in this chat the moment it finishes (or errors, stalls, or ` +
+        `needs a human). Do NOT wait or poll — just delegate any other tasks now and end your turn; ` +
+        `you'll be woken to evaluate each result as it lands.`
+      : `(Auto-notify could not be armed — fall back to a single check({ agent: "${agent}", session: ` +
+        `"${sessionId}" }) when you expect it to be done.)`)
   );
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// await_agent — block (server-side) until the delegated session finishes, OR the
-// agent pauses to ask a human (return early so the master can relay — otherwise
-// master waits for agent while agent waits for human = deadlock). One model call
-// replaces a polling loop of check()s.
-async function awaitAgent({ agent, session }) {
-  if (!agent || !session) throw new Error("await_agent requires { agent, session }");
-  const t = findTarget(agent);
-  if (!t) throw new Error(`unknown agent "${agent}"`);
-  const base = t.daemonURL.replace(/\/+$/, "");
-  const bridge = bridgeOf(t);
-  const deadline = Date.now() + 20 * 60 * 1000;
-  while (Date.now() < deadline) {
-    const ask = await jfetch(`${bridge}/ask`).catch(() => null);
-    if (ask?.body?.pending)
-      return (
-        `⚠ "${agent}" PAUSED to ask the human: "${ask.body.pending.question}"\n` +
-        `Relay it (ask_human + answer_agent) or answer yourself if permitted, then await_agent again.`
-      );
-    const r = await jfetch(`${base}/session/${encodeURIComponent(session)}/message`).catch(() => null);
-    if (r?.ok && Array.isArray(r.body)) {
-      let last = null;
-      for (const m of r.body) if (((m.info || m).role || "") === "assistant") last = m;
-      if (last && (last.info || last).time?.completed) {
-        const text = (last.parts || [])
-          .filter((p) => p.type === "text" && p.text)
-          .map((p) => p.text)
-          .join("\n")
-          .trim();
-        const ob = await jfetch(`${bridge}/outbox`).catch(() => null);
-        const files = (ob?.body?.files || []).map((f) => f.name);
-        return (
-          `"${agent}" is DONE.\n\n${text || "(no text output)"}` +
-          (files.length ? `\n\nFiles it shared: ${files.join(", ")} — collect_file to surface them.` : "")
-        );
-      }
-    }
-    await sleep(4000);
-  }
-  return `"${agent}" is still working after 20 min — call await_agent again to keep waiting.`;
+// Deprecated. Delegation now auto-notifies the master on completion (the bridge
+// /watch mechanism wakes this chat). Kept as a shim so a master still running an
+// older AGENTS.md that calls await_agent doesn't hit "unknown tool" — it just
+// does one status glance and tells the master to stop waiting.
+async function awaitAgent(args) {
+  if (!args?.agent || !args?.session) throw new Error("await_agent requires { agent, session }");
+  let status = "";
+  try { status = await check(args); } catch { /* ignore */ }
+  return (
+    `(You don't need await_agent anymore — you're notified automatically in this chat when ` +
+    `"${args.agent}" finishes, errors, stalls, or needs a human. Just end your turn.)\n\n` +
+    (status || "")
+  ).trim();
 }
 
 async function check({ agent, session }) {
@@ -259,7 +245,9 @@ const TOOLS = {
   delegate: {
     description:
       "Hand a task to one agent. It runs in that agent's own chat/session using its " +
-      "configured model. Returns the session id — then poll it with check().",
+      "configured model. You are AUTOMATICALLY re-prompted in this chat when it finishes " +
+      "(or errors / stalls / needs a human) — do NOT wait or poll. Delegate freely and end " +
+      "your turn; each result wakes you to evaluate it.",
     inputSchema: {
       type: "object",
       properties: {
@@ -273,9 +261,9 @@ const TOOLS = {
   },
   await_agent: {
     description:
-      "Wait for a delegated agent to finish. Blocks until the agent is DONE (returns its " +
-      "result + shared files) or PAUSES to ask a human (returns so you can relay/answer). " +
-      "Call this ONCE after delegate — do not poll check() in a loop.",
+      "Deprecated — you are notified automatically when a delegated agent finishes, so you " +
+      "do not need to wait. Calling this just confirms that and gives a one-off status; then " +
+      "end your turn.",
     inputSchema: {
       type: "object",
       properties: {
@@ -289,8 +277,9 @@ const TOOLS = {
   },
   check: {
     description:
-      "Peek at an agent's progress once (non-blocking) — for a status glance. To WAIT for " +
-      "completion use await_agent, not a check loop. Also surfaces a blocked human-question / shared files.",
+      "Peek at an agent's progress once (non-blocking) — for an optional status glance. You " +
+      "do NOT need this to learn when an agent is done: delegate auto-notifies you. Also " +
+      "surfaces a blocked human-question / shared files.",
     inputSchema: {
       type: "object",
       properties: {
