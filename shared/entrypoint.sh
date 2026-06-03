@@ -41,6 +41,7 @@ cat > /root/.config/opencode/opencode.jsonc <<EOF
 {
   "\$schema": "https://opencode.ai/config.json",
   "permission": { "*": "allow" },
+  "plugin": ["file:///usr/local/bin/supervise-plugin.mjs"],
   "mcp": { $MCP }
 }
 EOF

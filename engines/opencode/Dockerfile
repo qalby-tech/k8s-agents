@@ -25,6 +25,9 @@ COPY shared/status-server.mjs /usr/local/bin/status-server.mjs
 COPY shared/fleet-mcp.mjs /usr/local/bin/fleet-mcp.mjs
 # bridge-mcp: ask_human tool (both roles), talks to the agent-bridge on :4097.
 COPY shared/bridge-mcp.mjs /usr/local/bin/bridge-mcp.mjs
+# supervise-plugin: opencode plugin that gates a master-delegated session's plan
+# + each step on master review (loaded via opencode.jsonc "plugin").
+COPY shared/supervise-plugin.mjs /usr/local/bin/supervise-plugin.mjs
 RUN chmod +x /usr/local/bin/fleet /usr/local/bin/agent-bootstrap /usr/local/bin/entrypoint.sh
 
 WORKDIR /workspace

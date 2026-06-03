@@ -90,6 +90,15 @@ async function delegate({ agent, task }) {
     throw new Error(`could not start a session on "${agent}" (status ${created.status})`);
   const sessionId = created.body.id;
 
+  // Mark this session supervised on the slave's bridge BEFORE it starts, so the
+  // slave's supervise plugin gates its plan + each step on our review. Only
+  // master-launched sessions are supervised; a user's direct chat is autonomous.
+  await jfetch(`${bridgeOf(t)}/supervise`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ session: sessionId }),
+  }).catch(() => null);
+
   const prompt = (t.instructions ? `${t.instructions}\n\n` : "") + task;
   const body = { parts: [{ type: "text", text: prompt }] };
   const model = parseModel(t.model);
@@ -215,6 +224,29 @@ async function answerAgent({ agent, answer }) {
   return `Answered "${agent}"'s question ("${pending.question}") with: ${answer}`;
 }
 
+// review_agent — answer a delegated agent's pending plan/step review (the agent
+// is blocked until you do). Finds the pending review for that session, like
+// answer_agent does for a pending human question.
+async function reviewAgent({ agent, session, decision, feedback }) {
+  if (!agent || !session || !decision) throw new Error("review_agent requires { agent, session, decision }");
+  const t = findTarget(agent);
+  if (!t) throw new Error(`unknown agent "${agent}"`);
+  const bridge = bridgeOf(t);
+  const rev = await jfetch(`${bridge}/review?session=${encodeURIComponent(session)}`);
+  const pending = rev.body?.pending;
+  if (!pending) return `"${agent}" has no plan or step waiting for your review right now.`;
+  const d = decision === "revise" ? "revise" : "approve";
+  const r = await jfetch(`${bridge}/review/answer`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ id: pending.id, decision: d, feedback: feedback || "" }),
+  });
+  if (!r.ok) throw new Error(`could not deliver the review to "${agent}" (status ${r.status})`);
+  return d === "revise"
+    ? `Sent "${agent}" back to revise its ${pending.kind}: ${feedback || "(no detail given)"}`
+    : `Approved "${agent}"'s ${pending.kind} — it will continue.`;
+}
+
 async function collectFile({ agent, name, caption }) {
   if (!agent || !name) throw new Error("collect_file requires { agent, name }");
   const t = findTarget(agent);
@@ -306,6 +338,25 @@ const TOOLS = {
       additionalProperties: false,
     },
     handler: answerAgent,
+  },
+  review_agent: {
+    description:
+      "Approve or send back a delegated agent's plan or a just-completed step. You're " +
+      "prompted with a [fleet-review] message when one is waiting, and the agent is BLOCKED " +
+      "until you answer. decision='approve' lets it continue; decision='revise' (with " +
+      "feedback) sends concrete corrections. Judge against the task you gave it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent: { type: "string" },
+        session: { type: "string", description: "the agent's session id (from delegate / the review message)" },
+        decision: { type: "string", enum: ["approve", "revise"] },
+        feedback: { type: "string", description: "what to change (required for revise)" },
+      },
+      required: ["agent", "session", "decision"],
+      additionalProperties: false,
+    },
+    handler: reviewAgent,
   },
   collect_file: {
     description:

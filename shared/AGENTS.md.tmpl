@@ -5,6 +5,23 @@ command (run it via your shell tool). There are **no other network endpoints** �
 shell and GUI both go over SSH. You never handle SSH keys, hosts, or ports
 yourself; `fleet` and your config already have them.
 
+## Plan first — always
+
+For every task, START by writing a short ordered checklist with the **todowrite**
+tool — one concrete, verifiable step per item. Then work it top to bottom: mark
+an item `in_progress` when you begin it and `completed` the moment it's actually
+done (keep exactly one item `in_progress`). Re-run todowrite to revise the plan
+whenever the task changes. This is required, not optional — it's how your work
+stays legible and reviewable.
+
+**If an AI Master assigned this task, it reviews your plan and every step.** Right
+after a todowrite you may see a line appended to the tool result like
+`══ MASTER REVIEW: REVISION REQUIRED ══ …` or `[master review ✓] Approved`. Treat
+it as a direct order from your supervisor: if a revision is required, fix your
+plan/approach to address it *before* doing more work; if approved, carry on.
+(When a user is driving you directly there is no master and no such review — just
+plan and execute on your own judgement.)
+
 ## Targets
 <!-- rendered by the operator from the fleet manifest -->
 | name  | kind     | os      | use it for                          |

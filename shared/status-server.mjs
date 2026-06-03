@@ -244,6 +244,23 @@ async function wakeMaster(masterSession, text) {
 // Returns true if it injected a wake this pass (so the caller stops for this tick
 // — one wake at a time, to let the master actually start before the next).
 async function processWatch(w) {
+  // 0) Pending plan/step review? The agent is BLOCKED waiting for the master to
+  // sign off — wake the master to approve/revise (one wake per distinct review).
+  const rev = await fetchJson(`${w.slaveBridge}/review?session=${encodeURIComponent(w.session)}`);
+  const pr = rev.body?.pending;
+  if (pr && w.lastReview !== pr.id) {
+    const woke = await wakeMaster(
+      w.masterSession,
+      `[fleet-review] Agent "${w.agent}" needs your sign-off on its ${pr.kind} before it continues (task: "${w.task}").\n\n` +
+        `Its ${pr.kind === "plan" ? "plan" : "progress so far"}:\n${pr.content}\n\n` +
+        `It is BLOCKED waiting on you — answer now:\n` +
+        `• approve → review_agent({ agent: "${w.agent}", session: "${w.session}", decision: "approve" })\n` +
+        `• send back → review_agent({ agent: "${w.agent}", session: "${w.session}", decision: "revise", feedback: "<precise changes>" })`,
+    );
+    if (woke) { w.lastReview = pr.id; return true; }
+    return false;
+  }
+
   // 1) Blocked on a human? Wake once per distinct question so the master relays.
   const ask = await fetchJson(`${w.slaveBridge}/ask`);
   const q = ask.body?.pending?.question;
@@ -314,6 +331,37 @@ async function watchTick() {
 }
 if (!IS_DAEMON) setInterval(watchTick, WATCH_POLL_MS); // masters only
 
+// ── master supervision: supervised sessions + plan/step review broker ─────────
+// A session the master delegated is "supervised": the supervise plugin gates it
+// on master approval after each todo update. Reviews are a SEPARATE channel from
+// ask_human — the master always decides a review itself (it never relays a review
+// to the human). The master's watch poller pulls pending reviews and answers via
+// the fleet review_agent tool; the supervise plugin long-polls /review/wait.
+const supervised = new Set();
+const reviews = new Map(); // id -> { session, kind, content, decision, feedback, ts }
+let reviewSeq = 0;
+const lastTodos = new Map(); // session -> last todo array (to classify plan vs step)
+
+const fmtTodos = (todos) =>
+  todos
+    .map((t) => `${t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : "[ ]"} ${String(t.content || "").trim()}`)
+    .join("\n");
+// First todowrite for a session = the plan; a later one whose completed-count
+// grew = a step just finished; otherwise the plan was revised/expanded.
+function classifyTodos(session, todos) {
+  const prev = lastTodos.get(session);
+  lastTodos.set(session, todos);
+  if (!prev) return "plan";
+  const done = (a) => a.filter((t) => t.status === "completed").length;
+  return done(todos) > done(prev) ? "step" : "plan";
+}
+const pendingReview = (session) => {
+  for (const [id, r] of reviews)
+    if (r.decision === undefined && (!session || r.session === session))
+      return { id, session: r.session, kind: r.kind, content: r.content };
+  return null;
+};
+
 // ── ask-human (global; transient) ────────────────────────────────────────────
 const asks = new Map();
 let askSeq = 0;
@@ -366,8 +414,55 @@ http
           startedAt: Date.now(),
           fails: 0,
           lastAsk: null,
+          lastReview: null,
         });
         return json(res, 200, { ok: true, id, masterSession: activeSession });
+      }
+
+      // ── master supervision (plan/step review) ──
+      // delegate() marks the new daemon session supervised; the supervise plugin
+      // asks /supervised before gating; it submits each todowrite to /review and
+      // long-polls /review/wait; the master answers via /review/answer.
+      if (p === "/supervise" && req.method === "POST") {
+        const { session } = await readBody(req);
+        if (session) supervised.add(basename(String(session)));
+        return json(res, 200, { ok: true });
+      }
+      if (p === "/supervised" && req.method === "GET") {
+        const s = u.searchParams.get("session");
+        return json(res, 200, { supervised: s ? supervised.has(basename(String(s))) : false });
+      }
+      if (p === "/review" && req.method === "POST") {
+        const { session, todos } = await readBody(req);
+        if (!session || !Array.isArray(todos)) return json(res, 400, { error: "session and todos required" });
+        const sid = basename(String(session));
+        const kind = classifyTodos(sid, todos);
+        const id = `rv${++reviewSeq}`;
+        reviews.set(id, { session: sid, kind, content: fmtTodos(todos), decision: undefined, feedback: "", ts: Date.now() });
+        return json(res, 200, { ok: true, id, kind });
+      }
+      if (p === "/review" && req.method === "GET")
+        return json(res, 200, { pending: pendingReview(u.searchParams.get("session")) });
+      if (p === "/review/wait" && req.method === "GET") {
+        const id = u.searchParams.get("id");
+        const r = reviews.get(id);
+        if (!r) return json(res, 404, { error: "unknown id" });
+        const deadline = Date.now() + 10 * 60 * 1000; // fail-open so a silent master can't deadlock the agent
+        const tick = () => {
+          const cur = reviews.get(id);
+          if (cur && cur.decision !== undefined) { reviews.delete(id); return json(res, 200, { decision: cur.decision, feedback: cur.feedback }); }
+          if (Date.now() > deadline) { reviews.delete(id); return json(res, 200, { timeout: true }); }
+          setTimeout(tick, 500);
+        };
+        return tick();
+      }
+      if (p === "/review/answer" && req.method === "POST") {
+        const { id, decision, feedback } = await readBody(req);
+        const r = reviews.get(id);
+        if (!r) return json(res, 404, { error: "unknown id" });
+        r.decision = decision === "revise" ? "revise" : "approve";
+        r.feedback = String(feedback || "");
+        return json(res, 200, { ok: true });
       }
 
       if (p === "/outbox" && req.method === "GET")
