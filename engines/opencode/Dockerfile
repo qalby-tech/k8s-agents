@@ -6,7 +6,7 @@ FROM node:22-slim
 # (drives the target fleet over SSH; jq builds/parses cua /cmd). sshpass: the
 # one-time ssh-copy-id bootstrap onto the VM using its password.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates curl openssh-client jq sshpass \
+    && apt-get install -y --no-install-recommends git ca-certificates curl openssh-client jq sshpass postgresql-client redis-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin opencode so engine + controller stay in lockstep.
