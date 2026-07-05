@@ -13,6 +13,9 @@
 //   POST /inbox                  { name, data, session } — a user attachment, saved
 //                                so the agent can open it
 //   GET  /ask | POST /ask | GET /ask/wait | POST /ask/answer   — ask_human (global)
+//   /db/*                        deterministic DB admin on storage daemons
+//                                (psql/redis-cli via the pod's connection env;
+//                                no LLM in the loop — see db-admin.mjs)
 //
 // Attachments are per-session dirs (outbox/<session>, inbox/<session>); another
 // session can still read them by path on disk.
@@ -21,6 +24,7 @@ import { execFile } from "node:child_process";
 import { readFile, readdir, stat, mkdir, unlink, writeFile, rm } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { join, basename, extname } from "node:path";
+import * as db from "./db-admin.mjs";
 
 const PORT = 4097;
 const OUTBOX = process.env.AGENT_OUTBOX || "/workspace/outbox";
@@ -497,6 +501,24 @@ http
         const safe = basename(String(name));
         await writeFile(join(dir, safe), Buffer.from(String(data).replace(/^data:[^;]*;base64,/, ""), "base64"));
         return json(res, 200, { ok: true, path: join(dir, safe) });
+      }
+
+      // ── deterministic DB admin (storage daemons) ──
+      // Shells out to psql/redis-cli with the pod's connection env; handlers
+      // live in db-admin.mjs and return { status, body } for this thin map.
+      if (p === "/db" || p.startsWith("/db/")) {
+        if (!db.engine()) return json(res, 503, { error: "no database configured" });
+        let r;
+        if (p === "/db/overview" && req.method === "GET") r = await db.overview();
+        else if (p === "/db/schema" && req.method === "GET") r = await db.schema(u.searchParams.get("database") || "");
+        else if (p === "/db/users" && req.method === "GET") r = await db.listUsers();
+        else if (p === "/db/users" && req.method === "POST") r = await db.createUser(await readBody(req));
+        else if (p.startsWith("/db/users/") && req.method === "DELETE")
+          r = await db.deleteUser(decodeURIComponent(p.slice("/db/users/".length)));
+        else if (p === "/db/migrations" && req.method === "GET") r = await db.listMigrations();
+        else if (p === "/db/migrations" && req.method === "POST") r = await db.applyMigration(await readBody(req));
+        if (r) return json(res, r.status, r.body);
+        return json(res, 404, { error: "unknown /db endpoint" });
       }
 
       if (p === "/ask" && req.method === "GET") return json(res, 200, { pending: pendingAsk() });

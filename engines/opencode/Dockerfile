@@ -21,6 +21,8 @@ COPY shared/agent-bootstrap /usr/local/bin/agent-bootstrap
 COPY shared/entrypoint.sh /usr/local/bin/entrypoint.sh
 # status-server: guest-status endpoint (:4097) the UI polls (cloud-init/cua/ssh).
 COPY shared/status-server.mjs /usr/local/bin/status-server.mjs
+# db-admin: deterministic /db/* handlers (psql/redis-cli) status-server imports.
+COPY shared/db-admin.mjs /usr/local/bin/db-admin.mjs
 # fleet-mcp: AI Master orchestration tools (delegate to slave daemons over HTTP).
 COPY shared/fleet-mcp.mjs /usr/local/bin/fleet-mcp.mjs
 # bridge-mcp: ask_human tool (both roles), talks to the agent-bridge on :4097.

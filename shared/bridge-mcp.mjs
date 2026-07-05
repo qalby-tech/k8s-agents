@@ -7,6 +7,10 @@
 //   share_file(path, caption, from) both roles — put a file in the chat's outbox
 //   screenshot()                   daemon only — capture the VM screen, return it
 //                                  as a native image (vision models see it directly)
+//   db_schema()                    storage daemon only — GET /db/schema (audited path)
+//   db_migrate(name, sql)          storage daemon only — POST /db/migrations: apply
+//                                  the SQL transactionally, record it in
+//                                  _platform_migrations, best-effort git-commit it
 //
 // Security: these add NO network listener and NO capability the agent doesn't
 // already have through `fleet`. The one new risk — share_file reading a pod-local
@@ -23,6 +27,9 @@ const PROTOCOL_VERSION = "2024-11-05";
 const ASK_TIMEOUT_MS = 15 * 60 * 1000;
 // Daemon (has a VM) vs master. The screenshot tool only exists on a daemon.
 const IS_DAEMON = existsSync("/etc/aidaemon/vm_user");
+// Storage daemon (postgres/redis connection env injected by the chart): the
+// deterministic /db/* bridge endpoints exist, so expose the db_* tools.
+const HAS_DB = !!(process.env.PGHOST || process.env.REDIS_HOST);
 // share_file (from=local) may only copy files the agent legitimately produced —
 // never the mounted secrets/keys/credentials. Allowlist, resolved through
 // symlinks, so nothing under /etc/aidaemon, /root/.ssh or the opencode auth.json
@@ -122,6 +129,30 @@ async function screenshot() {
   };
 }
 
+// ── DB admin (storage daemon): call the bridge's audited /db/* endpoints ─────
+// Same deterministic path the platform uses — never hand-roll psql for schema
+// changes, so every migration lands in _platform_migrations + git.
+async function dbSchema() {
+  const r = await jfetch(`${BRIDGE}/db/schema`, {}, 30000);
+  if (!r.ok) throw new Error(`schema fetch failed (status ${r.status}): ${JSON.stringify(r.body).slice(0, 500)}`);
+  return JSON.stringify(r.body, null, 2);
+}
+
+async function dbMigrate({ name, sql }) {
+  if (!name || !String(name).trim()) throw new Error("db_migrate requires a non-empty name");
+  if (!sql || !String(sql).trim()) throw new Error("db_migrate requires non-empty sql");
+  const r = await jfetch(`${BRIDGE}/db/migrations`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: String(name), sql: String(sql) }),
+  }, 120000);
+  if (!r.ok) {
+    const detail = r.body?.detail || r.body?.error || JSON.stringify(r.body);
+    throw new Error(`migration NOT applied (status ${r.status}): ${String(detail).slice(0, 800)}`);
+  }
+  return `Migration applied: version ${r.body?.version} ("${name}"). Git: ${r.body?.git || "unknown"}.`;
+}
+
 const TOOLS = {
   ask_human: {
     description:
@@ -163,6 +194,33 @@ if (IS_DAEMON) {
       "it -> act (click/type) -> screenshot to confirm.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     handler: screenshot,
+  };
+}
+
+if (HAS_DB) {
+  TOOLS.db_schema = {
+    description:
+      "Get the database schema (tables, columns, indexes, row estimates) as JSON " +
+      "via the bridge's deterministic /db/schema endpoint. Postgres only.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    handler: dbSchema,
+  };
+  TOOLS.db_migrate = {
+    description:
+      "Apply a schema migration through the platform's audited path: the SQL runs " +
+      "in ONE transaction, is recorded in _platform_migrations, and is committed to " +
+      "the migrations git repo. ALWAYS use this for schema changes instead of raw " +
+      "psql, so the schema history stays replayable. On failure nothing is applied.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "short human title, e.g. 'add orders index'" },
+        sql: { type: "string", description: "the migration SQL (max 256KB)" },
+      },
+      required: ["name", "sql"],
+      additionalProperties: false,
+    },
+    handler: dbMigrate,
   };
 }
 
