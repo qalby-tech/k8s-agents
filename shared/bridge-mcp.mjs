@@ -60,12 +60,12 @@ async function jfetch(url, opts = {}, timeoutMs = 30000) {
 
 // ── tools ────────────────────────────────────────────────────────────────────
 
-async function askHuman({ question }) {
+async function askHuman({ question, kind, options }) {
   if (!question || !String(question).trim()) throw new Error("ask_human requires a non-empty question");
   const created = await jfetch(`${BRIDGE}/ask`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ question: String(question) }),
+    body: JSON.stringify({ question: String(question), kind, options }),
   });
   if (!created.ok || !created.body?.id) throw new Error(`could not post the question (status ${created.status})`);
   const id = created.body.id;
@@ -161,7 +161,15 @@ const TOOLS = {
       "until they answer (~15 min). Returns their exact words.",
     inputSchema: {
       type: "object",
-      properties: { question: { type: "string", description: "what to ask the user" } },
+      properties: {
+        question: { type: "string", description: "what to ask the user" },
+        kind: {
+          type: "string",
+          enum: ["input", "approve", "choose", "captcha"],
+          description: "input=free text (default); approve=yes/no confirmation before something risky; choose=pick one of `options`; captcha=a human must act in the live browser/VNC",
+        },
+        options: { type: "array", items: { type: "string" }, description: "for kind=choose: 2-8 choices" },
+      },
       required: ["question"],
       additionalProperties: false,
     },

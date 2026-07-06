@@ -370,7 +370,8 @@ const pendingReview = (session) => {
 const asks = new Map();
 let askSeq = 0;
 const pendingAsk = () => {
-  for (const [id, a] of asks) if (a.answer === undefined) return { id, question: a.question, ts: a.ts };
+  for (const [id, a] of asks)
+    if (a.answer === undefined) return { id, question: a.question, kind: a.kind, options: a.options, ts: a.ts };
   return null;
 };
 
@@ -523,10 +524,15 @@ http
 
       if (p === "/ask" && req.method === "GET") return json(res, 200, { pending: pendingAsk() });
       if (p === "/ask" && req.method === "POST") {
-        const { question } = await readBody(req);
+        const { question, kind, options } = await readBody(req);
         if (!question) return json(res, 400, { error: "question required" });
         const id = `ask${++askSeq}`;
-        asks.set(id, { question: String(question), answer: undefined, ts: Date.now() });
+        // kind: input (default) | approve | choose | captcha — structured asks
+        // let the console render one-tap widgets and let the master triage
+        // safely (it never auto-answers approve/captcha).
+        const k = ["input", "approve", "choose", "captcha"].includes(kind) ? kind : "input";
+        const opts = Array.isArray(options) ? options.slice(0, 8).map(String) : undefined;
+        asks.set(id, { question: String(question), kind: k, options: opts, answer: undefined, ts: Date.now() });
         return json(res, 200, { id });
       }
       if (p === "/ask/wait" && req.method === "GET") {
