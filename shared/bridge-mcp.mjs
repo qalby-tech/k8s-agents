@@ -11,6 +11,9 @@
 //   db_migrate(name, sql)          storage daemon only — POST /db/migrations: apply
 //                                  the SQL transactionally, record it in
 //                                  _platform_migrations, best-effort git-commit it
+//   search_charts(query, limit?)   in-cluster pods — Helm-chart discovery via
+//                                  tenant-api's Artifact Hub proxy (the pod has
+//                                  no internet egress; tenant-api does)
 //
 // Security: these add NO network listener and NO capability the agent doesn't
 // already have through `fleet`. The one new risk — share_file reading a pod-local
@@ -19,10 +22,24 @@
 import { createInterface } from "node:readline";
 import { execFile } from "node:child_process";
 import { readFile, unlink, realpath, stat } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { basename } from "node:path";
 
 const BRIDGE = process.env.AGENT_BRIDGE || "http://127.0.0.1:4097";
+// The platform API (tenant-api), reachable in-cluster from daemon/master pods
+// (a per-pod NetworkPolicy allows egress to tenant-api:8080 — the tenant
+// namespace's egress rules exclude private CIDRs otherwise). The tenant name
+// derives from the pod's namespace (tenant-<name>) via the serviceaccount
+// mount, so no extra env plumbing is needed; both are overridable for dev.
+const TENANT_API = process.env.TENANT_API || "http://tenant-api.tenant-api.svc.cluster.local:8080";
+const TENANT = (() => {
+  if (process.env.TENANT_NAME) return process.env.TENANT_NAME;
+  try {
+    const ns = readFileSync("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "utf8").trim();
+    if (ns.startsWith("tenant-")) return ns.slice("tenant-".length);
+  } catch {}
+  return "";
+})();
 const PROTOCOL_VERSION = "2024-11-05";
 const ASK_TIMEOUT_MS = 15 * 60 * 1000;
 // Daemon (has a VM) vs master. The screenshot tool only exists on a daemon.
@@ -153,6 +170,27 @@ async function dbMigrate({ name, sql }) {
   return `Migration applied: version ${r.body?.version} ("${name}"). Git: ${r.body?.git || "unknown"}.`;
 }
 
+// ── Chart discovery: tenant-api's Artifact Hub proxy ─────────────────────────
+// The pod can't reach the internet, so discovery goes through the platform API
+// (which can). Read-only; returns chart metadata the model uses to pick the
+// app's official image — nothing is installed.
+async function searchCharts({ query, limit }) {
+  if (!query || !String(query).trim()) throw new Error("search_charts requires a non-empty query");
+  const n = Math.min(Math.max(parseInt(limit, 10) || 5, 1), 10);
+  const u = `${TENANT_API}/v1/tenants/${encodeURIComponent(TENANT)}/charts/search` +
+    `?q=${encodeURIComponent(String(query).trim())}&limit=${n}`;
+  // 15s: tenant-api itself caps the upstream Artifact Hub call at 10s.
+  const r = await jfetch(u, {}, 15000);
+  if (!r.ok) {
+    const detail = r.body?.error || JSON.stringify(r.body);
+    throw new Error(`chart search failed (status ${r.status}): ${String(detail).slice(0, 400)}`);
+  }
+  const charts = r.body?.charts || [];
+  if (!charts.length)
+    return `No charts found for "${query}" — try the app's plain name or a broader term.`;
+  return JSON.stringify(charts, null, 2);
+}
+
 const TOOLS = {
   ask_human: {
     description:
@@ -229,6 +267,30 @@ if (HAS_DB) {
       additionalProperties: false,
     },
     handler: dbMigrate,
+  };
+}
+
+// Chart discovery is only meaningful (and only routable) from an in-cluster
+// tenant pod — TENANT resolves there from the pod's namespace.
+if (TENANT) {
+  TOOLS.search_charts = {
+    description:
+      "Search Helm charts (Artifact Hub, proxied by the platform) to DISCOVER how " +
+      "a known app ships: name, repository, repoUrl, version, appVersion, " +
+      "description, stars, official. Use it when asked to deploy an existing app " +
+      "you don't know the image for; then run `helm show values <name> --repo " +
+      "<repoUrl>` READ-ONLY to learn its image/env/port and wrap that official " +
+      "image in a Dockerfile — never install the chart itself.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "the app to look for, e.g. 'nextcloud' or 'workflow automation'" },
+        limit: { type: "integer", minimum: 1, maximum: 10, description: "max results (default 5)" },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+    handler: searchCharts,
   };
 }
 
