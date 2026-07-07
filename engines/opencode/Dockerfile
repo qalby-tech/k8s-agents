@@ -9,6 +9,14 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates curl openssh-client jq sshpass postgresql-client redis-tools \
     && rm -rf /var/lib/apt/lists/*
 
+# helm — agents use it read-only as a REFERENCE when deploying a known app:
+# `helm show values <chart>` / `helm template` to learn an app's config,
+# image and env. Charts are never installed by an agent; the app deploys as
+# platform resources (a container/git app wrapping the official image).
+RUN curl -fsSL https://get.helm.sh/helm-v3.16.3-linux-amd64.tar.gz \
+    | tar -xzO linux-amd64/helm > /usr/local/bin/helm \
+    && chmod +x /usr/local/bin/helm
+
 # Pin opencode so engine + controller stay in lockstep.
 ARG OPENCODE_VERSION=1.15.12
 RUN npm install -g opencode-ai@${OPENCODE_VERSION}
