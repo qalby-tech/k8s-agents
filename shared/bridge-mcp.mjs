@@ -32,6 +32,19 @@ const BRIDGE = process.env.AGENT_BRIDGE || "http://127.0.0.1:4097";
 // derives from the pod's namespace (tenant-<name>) via the serviceaccount
 // mount, so no extra env plumbing is needed; both are overridable for dev.
 const TENANT_API = process.env.TENANT_API || "http://tenant-api.tenant-api.svc.cluster.local:8080";
+// Workspace identity for tenant-api: the chart mounts a projected, audience-
+// bound ServiceAccount token (agent-sa) here. tenant-api validates it via
+// TokenReview and scopes the caller to this workspace. Re-read per call — the
+// kubelet rotates the file; it's tiny. Absent in dev → no header (tenant-api's
+// legacy paths still apply there).
+const TENANT_API_TOKEN_PATH = process.env.TENANT_API_TOKEN_PATH || "/var/run/secrets/tenant-api/token";
+function apiAuthHeaders() {
+  try {
+    const tok = readFileSync(TENANT_API_TOKEN_PATH, "utf8").trim();
+    if (tok) return { authorization: `Bearer ${tok}` };
+  } catch {}
+  return {};
+}
 const TENANT = (() => {
   if (process.env.TENANT_NAME) return process.env.TENANT_NAME;
   try {
@@ -180,7 +193,7 @@ async function searchCharts({ query, limit }) {
   const u = `${TENANT_API}/v1/tenants/${encodeURIComponent(TENANT)}/charts/search` +
     `?q=${encodeURIComponent(String(query).trim())}&limit=${n}`;
   // 15s: tenant-api itself caps the upstream Artifact Hub call at 10s.
-  const r = await jfetch(u, {}, 15000);
+  const r = await jfetch(u, { headers: apiAuthHeaders() }, 15000);
   if (!r.ok) {
     const detail = r.body?.error || JSON.stringify(r.body);
     throw new Error(`chart search failed (status ${r.status}): ${String(detail).slice(0, 400)}`);
