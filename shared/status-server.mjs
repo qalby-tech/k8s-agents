@@ -127,7 +127,12 @@ const ACTIVE_WINDOW = 10 * 60 * 1000; // 10 min
 const MAX_PROBE = 16;
 async function sessionRunning(sid) {
   try {
-    const mres = await fetch(`http://127.0.0.1:4096/session/${sid}/message`);
+    // Bounded: a long session's message list can be MBs and take seconds to
+    // serialize — never let one slow probe hold the whole /busy sweep.
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), 3000);
+    const mres = await fetch(`http://127.0.0.1:4096/session/${sid}/message`, { signal: ac.signal });
+    clearTimeout(t);
     const msgs = await mres.json();
     let lastRole = "", lastAssistantDone = true, running = false;
     for (const m of Array.isArray(msgs) ? msgs : []) {
@@ -142,8 +147,21 @@ async function sessionRunning(sid) {
     return false;
   }
 }
+// Stale-while-revalidate: /busy is polled every ~5s per open chat, and a
+// fresh sweep costs up to seconds (opencode serializes each candidate
+// session's full message list). Serving the last snapshot instantly and
+// refreshing in the background keeps the UI at ~0ms; a blinking dot may lag
+// reality by one poll, which is invisible.
+let busyRefreshing = null;
 async function busy() {
-  if (busyCache && Date.now() - busyAt < 2500) return busyCache;
+  const stale = !busyCache || Date.now() - busyAt >= 2500;
+  if (stale && !busyRefreshing) {
+    busyRefreshing = busySweep().finally(() => (busyRefreshing = null));
+  }
+  if (busyCache) return busyCache; // instant (possibly one poll stale)
+  return busyRefreshing; // first call ever: nothing cached yet, wait once
+}
+async function busySweep() {
   let out = { busy: false, session: null, sessions: [], tasks: {} };
   try {
     const ac = new AbortController();
