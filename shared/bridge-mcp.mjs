@@ -53,8 +53,18 @@ const TENANT = (() => {
   } catch {}
   return "";
 })();
+// The local opencode server (same pod) — used to resolve which session is
+// executing an ask_human call and to deliver late answers into it.
+const OPENCODE = process.env.OPENCODE_BASE || "http://127.0.0.1:4096";
 const PROTOCOL_VERSION = "2024-11-05";
-const ASK_TIMEOUT_MS = 15 * 60 * 1000;
+// Active block: how long the ask_human tool call itself waits. Chosen under
+// any client-side MCP request timeout so OUR "NO ANSWER YET — STOP" result
+// reaches the model instead of a client abort.
+const ASK_TIMEOUT_MS = 10 * 60 * 1000;
+// Detached watch: after the tool call ends (timeout or client cancellation),
+// keep watching for the answer in the background and deliver it into the
+// session as a user message — a late answer must never be dropped.
+const ASK_DETACHED_MS = 24 * 60 * 60 * 1000;
 // Daemon (has a VM) vs master. The screenshot tool only exists on a daemon.
 const IS_DAEMON = existsSync("/etc/aidaemon/vm_user");
 // Storage daemon (postgres/redis connection env injected by the chart): the
@@ -90,7 +100,137 @@ async function jfetch(url, opts = {}, timeoutMs = 30000) {
 
 // ── tools ────────────────────────────────────────────────────────────────────
 
-async function askHuman({ question, kind, options }) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ── ask_human answer channels ────────────────────────────────────────────────
+// An answer can arrive two ways:
+//   1. the bridge: chat dock widget / tenant-api's answer endpoint POST
+//      /ask/answer → our /ask/wait long-poll resolves;
+//   2. the session: tenant-api's task-answer fallback injects the answer as a
+//      USER message into the opencode session (prompt_async).
+// The tool watches BOTH. To watch the session it must know WHICH session is
+// executing this call — an MCP tool doesn't get told, so we find it: the
+// calling session's message list carries a running `ask_human` tool part whose
+// input contains our question.
+
+async function sessionMessages(sid) {
+  const r = await jfetch(`${OPENCODE}/session/${encodeURIComponent(sid)}/message`, {}, 6000).catch(() => null);
+  return Array.isArray(r?.body) ? r.body : null;
+}
+
+// A short, JSON-escape-safe needle from the question for input matching.
+const questionNeedle = (q) => String(q).replace(/[^a-zA-Z0-9 ]+/g, "").replace(/\s+/g, " ").trim().slice(0, 40);
+
+async function resolveAskSession(question) {
+  const needle = questionNeedle(question);
+  const r = await jfetch(`${OPENCODE}/session`, {}, 6000).catch(() => null);
+  const now = Date.now();
+  const candidates = (Array.isArray(r?.body) ? r.body : [])
+    .filter((s) => s?.id && now - (s?.time?.updated || 0) < 10 * 60 * 1000)
+    .sort((a, b) => (b?.time?.updated || 0) - (a?.time?.updated || 0))
+    .slice(0, 16);
+  for (const s of candidates) {
+    const msgs = await sessionMessages(s.id);
+    if (!msgs) continue;
+    for (const m of msgs) {
+      for (const p of m.parts || []) {
+        if (p.type !== "tool" || !p.state) continue;
+        if (p.state.status !== "running" && p.state.status !== "pending") continue;
+        if (!String(p.tool || "").includes("ask_human")) continue;
+        const input = JSON.stringify(p.state.input ?? p.state.args ?? {}).replace(/[^a-zA-Z0-9 ]+/g, "").replace(/\s+/g, " ");
+        if (!needle || input.includes(needle)) return { sid: s.id, baseline: msgs.length };
+      }
+    }
+  }
+  return null;
+}
+
+// A NEW user message that arrived after the ask was posted = the answer
+// (tenant-api's task-answer path, or the user typing into the chat).
+function newUserAnswer(msgs, baseline) {
+  for (let i = baseline; i < msgs.length; i++) {
+    const info = msgs[i].info || msgs[i];
+    if ((info.role || "") !== "user") continue;
+    const text = (msgs[i].parts || []).filter((p) => p.type === "text" && p.text).map((p) => p.text).join("\n").trim();
+    // tenant-api's task-answer path already prefixes "HUMAN ANSWER: " — strip
+    // it so the tool result doesn't double the marker.
+    if (text) return text.replace(/^HUMAN ANSWER:\s*/i, "");
+  }
+  return null;
+}
+
+// Mirrors status-server's sessionRunning reduction (is the turn still going?).
+function sessionLooksRunning(msgs) {
+  let lastRole = "", lastAssistantDone = true, running = false;
+  for (const m of Array.isArray(msgs) ? msgs : []) {
+    const info = m.info || m;
+    lastRole = info.role || lastRole;
+    if ((info.role || "") === "assistant") lastAssistantDone = !!info?.time?.completed;
+    for (const p of m.parts || [])
+      if (p.type === "tool" && p.state && (p.state.status === "running" || p.state.status === "pending")) running = true;
+  }
+  return running || lastRole === "user" || !lastAssistantDone;
+}
+
+function settleBridgeAsk(id, answer) {
+  return jfetch(`${BRIDGE}/ask/answer`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ id, answer }),
+  }).catch(() => null);
+}
+
+// Deliver a late answer INTO the calling session as a user message (waiting
+// for the current turn to end first, like the master-wake path does).
+async function injectUserMessage(sid, text) {
+  for (let i = 0; i < 60; i++) {
+    const msgs = await sessionMessages(sid);
+    if (msgs && !sessionLooksRunning(msgs)) break;
+    await sleep(5000);
+  }
+  await jfetch(`${OPENCODE}/session/${encodeURIComponent(sid)}/prompt_async`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ parts: [{ type: "text", text }] }),
+  }, 10000).catch(() => null);
+}
+
+// After the tool call itself is gone (client cancelled it, or we returned the
+// STOP text on timeout), keep watching: a late answer is injected into the
+// session so it is never lost; an answer that arrived AS a session message
+// just settles the bridge entry. Gives up after ASK_DETACHED_MS and abandons
+// the ask so it stops shadowing newer ones.
+async function watchAnswerDetached(id, where) {
+  const deadline = Date.now() + ASK_DETACHED_MS;
+  while (Date.now() < deadline) {
+    const w = await jfetch(`${BRIDGE}/ask/wait?id=${encodeURIComponent(id)}&timeout=4000`, {}, 15000).catch(() => null);
+    if (w && w.status === 404) return; // ask gone (bridge restarted)
+    if (w?.body?.answered) {
+      if (where)
+        await injectUserMessage(
+          where.sid,
+          `HUMAN ANSWER: ${w.body.answer}\n\nThis answers your earlier ask_human question (that tool call had already ended). Continue with this answer.`,
+        );
+      return;
+    }
+    if (where) {
+      const msgs = await sessionMessages(where.sid);
+      const ans = msgs && newUserAnswer(msgs, where.baseline);
+      if (ans != null) {
+        await settleBridgeAsk(id, ans); // already in the session — just settle
+        return;
+      }
+    }
+    await sleep(3000);
+  }
+  jfetch(`${BRIDGE}/ask/abandon`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ id }),
+  }).catch(() => null);
+}
+
+async function askHuman({ question, kind, options }, ctx = {}) {
   if (!question || !String(question).trim()) throw new Error("ask_human requires a non-empty question");
   const created = await jfetch(`${BRIDGE}/ask`, {
     method: "POST",
@@ -99,12 +239,42 @@ async function askHuman({ question, kind, options }) {
   });
   if (!created.ok || !created.body?.id) throw new Error(`could not post the question (status ${created.status})`);
   const id = created.body.id;
+  const where = await resolveAskSession(question).catch(() => null);
+  const dupNote =
+    "\n\n(Note: this answer may also appear as the next user message in this session — it is the SAME answer, do not treat it as a second instruction.)";
   const deadline = Date.now() + ASK_TIMEOUT_MS;
+  let n = 0;
   while (Date.now() < deadline) {
-    const w = await jfetch(`${BRIDGE}/ask/wait?id=${encodeURIComponent(id)}`, {}, 30000).catch(() => null);
-    if (w?.body?.answered) return `The human answered:\n\n${w.body.answer}`;
+    // The MCP client cancelled this call (its own request timeout): our return
+    // value would be dropped, so switch to detached delivery.
+    if (ctx.isCancelled?.()) {
+      watchAnswerDetached(id, where).catch(() => {});
+      return "CANCELLED";
+    }
+    // Progress notifications reset the client's request timeout when it
+    // supports that (MCP resetTimeoutOnProgress); harmless otherwise.
+    if (ctx.progressToken !== undefined && ctx.progressToken !== null)
+      send({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: ctx.progressToken, progress: ++n } });
+    const w = await jfetch(`${BRIDGE}/ask/wait?id=${encodeURIComponent(id)}&timeout=2000`, {}, 10000).catch(() => null);
+    if (w?.body?.answered) return `HUMAN ANSWER: ${w.body.answer}\n\nProceed accordingly.`;
+    if (where) {
+      const msgs = await sessionMessages(where.sid);
+      const ans = msgs && newUserAnswer(msgs, where.baseline);
+      if (ans != null) {
+        await settleBridgeAsk(id, ans); // stop the pending-ask surfacing
+        return `HUMAN ANSWER: ${ans}\n\nProceed accordingly.${dupNote}`;
+      }
+    }
+    await sleep(600);
   }
-  return "No answer from the human within 15 minutes — use your best judgement, or ask again if essential.";
+  // No answer inside the active window. Keep watching in the background (a
+  // late answer gets injected as a user message) and make the model STOP.
+  watchAnswerDetached(id, where).catch(() => {});
+  return (
+    "NO ANSWER YET. STOP NOW: end your turn without taking ANY further action. " +
+    "The human's answer will arrive as a new message and you will continue then. " +
+    "Acting without the answer is a policy violation."
+  );
 }
 
 // Hand a file to the bridge, which files it under the ACTIVE session's outbox
@@ -207,9 +377,14 @@ async function searchCharts({ query, limit }) {
 const TOOLS = {
   ask_human: {
     description:
-      "Ask the human user a question and wait for their reply. Use for decisions, " +
-      "missing info, credentials, or confirmation before something risky. Blocks " +
-      "until they answer (~15 min). Returns their exact words.",
+      "Ask the human user a question and WAIT for their reply. Use for decisions, " +
+      "missing info, credentials, or confirmation before something risky. The call " +
+      "BLOCKS until the answer arrives (up to ~10 min) and returns their exact words. " +
+      "HARD RULE: take NO further action until you have the answer. If it returns " +
+      "NO ANSWER YET (or the call errors/times out), STOP and end your turn " +
+      "immediately — the answer will arrive as a new message and you continue then. " +
+      "Never perform destructive or irreversible actions between asking and receiving " +
+      "the answer.",
     inputSchema: {
       type: "object",
       properties: {
@@ -313,15 +488,24 @@ const reply = (id, result) => send({ jsonrpc: "2.0", id, result });
 const fail = (id, code, message) => send({ jsonrpc: "2.0", id, error: { code, message } });
 const toContent = (r) => (r && typeof r === "object" && Array.isArray(r.content) ? r : { content: [{ type: "text", text: String(r) }] });
 
+// Requests the client cancelled mid-flight (notifications/cancelled). A
+// blocking tool (ask_human) checks this so it can switch to detached answer
+// delivery — its return value would be dropped anyway.
+const cancelledRequests = new Set();
+
 async function handle(msg) {
   const { id, method, params } = msg;
   if (method === "initialize")
     return reply(id, {
       protocolVersion: params?.protocolVersion || PROTOCOL_VERSION,
       capabilities: { tools: {} },
-      serverInfo: { name: "bridge-mcp", version: "0.2.0" },
+      serverInfo: { name: "bridge-mcp", version: "0.3.0" },
     });
-  if (method === "notifications/initialized" || method === "notifications/cancelled") return;
+  if (method === "notifications/cancelled") {
+    if (params?.requestId !== undefined) cancelledRequests.add(params.requestId);
+    return;
+  }
+  if (method === "notifications/initialized") return;
   if (method === "ping") return reply(id, {});
   if (method === "tools/list")
     return reply(id, {
@@ -330,11 +514,18 @@ async function handle(msg) {
   if (method === "tools/call") {
     const tool = TOOLS[params?.name];
     if (!tool) return fail(id, -32602, `unknown tool: ${params?.name}`);
+    const ctx = {
+      requestId: id,
+      progressToken: params?._meta?.progressToken,
+      isCancelled: () => cancelledRequests.has(id),
+    };
     try {
-      const out = await tool.handler(params?.arguments || {});
+      const out = await tool.handler(params?.arguments || {}, ctx);
       return reply(id, toContent(out));
     } catch (e) {
       return reply(id, { content: [{ type: "text", text: `ERROR: ${e?.message || e}` }], isError: true });
+    } finally {
+      cancelledRequests.delete(id);
     }
   }
   if (id !== undefined) fail(id, -32601, `method not found: ${method}`);

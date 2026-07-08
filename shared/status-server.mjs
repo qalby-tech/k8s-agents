@@ -557,7 +557,10 @@ http
         const id = u.searchParams.get("id");
         const a = asks.get(id);
         if (!a) return json(res, 404, { error: "unknown id" });
-        const deadline = Date.now() + 25000;
+        // ?timeout=<ms> lets a caller long-poll on a short cadence (bridge-mcp
+        // interleaves this with session polling every ~2-3s). Default 25s.
+        const waitMs = Math.min(Math.max(parseInt(u.searchParams.get("timeout"), 10) || 25000, 500), 25000);
+        const deadline = Date.now() + waitMs;
         const tick = () => {
           const cur = asks.get(id);
           if (cur && cur.answer !== undefined) return json(res, 200, { answered: true, answer: cur.answer });
@@ -571,6 +574,14 @@ http
         const a = asks.get(id);
         if (!a) return json(res, 404, { error: "unknown id" });
         a.answer = String(answer ?? "");
+        return json(res, 200, { ok: true });
+      }
+      // Abandon a stale unanswered ask (the asker gave up watching) so it
+      // stops shadowing newer asks in the pending view.
+      if (p === "/ask/abandon" && req.method === "POST") {
+        const { id } = await readBody(req);
+        const a = asks.get(id);
+        if (a && a.answer === undefined) asks.delete(id);
         return json(res, 200, { ok: true });
       }
       res.writeHead(404);
