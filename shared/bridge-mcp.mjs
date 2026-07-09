@@ -57,14 +57,27 @@ const TENANT = (() => {
 // executing an ask_human call and to deliver late answers into it.
 const OPENCODE = process.env.OPENCODE_BASE || "http://127.0.0.1:4096";
 const PROTOCOL_VERSION = "2024-11-05";
-// Active block: how long the ask_human tool call itself waits. Chosen under
-// any client-side MCP request timeout so OUR "NO ANSWER YET — STOP" result
-// reaches the model instead of a client abort.
-const ASK_TIMEOUT_MS = 10 * 60 * 1000;
-// Detached watch: after the tool call ends (timeout or client cancellation),
-// keep watching for the answer in the background and deliver it into the
-// session as a user message — a late answer must never be dropped.
-const ASK_DETACHED_MS = 24 * 60 * 60 * 1000;
+// Active block: how long the ask_human tool call itself waits before returning
+// the STOP result. Workspace-configurable (TenantSpec ai.askWaitMinutes →
+// rendered into the daemon/master Secret as `ask_wait_minutes`, mounted at
+// /etc/aidaemon | /etc/aimaster); ASK_WAIT_MINUTES env overrides for dev.
+// Clamped 1..60, default 10.
+const ASK_WAIT_MINUTES = (() => {
+  const parse = (s) => {
+    const n = parseInt(String(s ?? "").trim(), 10);
+    return Number.isFinite(n) && n >= 1 && n <= 60 ? n : null;
+  };
+  const fromEnv = parse(process.env.ASK_WAIT_MINUTES);
+  if (fromEnv) return fromEnv;
+  for (const p of ["/etc/aidaemon/ask_wait_minutes", "/etc/aimaster/ask_wait_minutes"]) {
+    try {
+      const n = parse(readFileSync(p, "utf8"));
+      if (n) return n;
+    } catch {}
+  }
+  return 10;
+})();
+const ASK_TIMEOUT_MS = ASK_WAIT_MINUTES * 60 * 1000;
 // Daemon (has a VM) vs master. The screenshot tool only exists on a daemon.
 const IS_DAEMON = existsSync("/etc/aidaemon/vm_user");
 // Storage daemon (postgres/redis connection env injected by the chart): the
@@ -198,13 +211,23 @@ async function injectUserMessage(sid, text) {
 // After the tool call itself is gone (client cancelled it, or we returned the
 // STOP text on timeout), keep watching: a late answer is injected into the
 // session so it is never lost; an answer that arrived AS a session message
-// just settles the bridge entry. Gives up after ASK_DETACHED_MS and abandons
-// the ask so it stops shadowing newer ones.
+// just settles the bridge entry. NO time cap — "waiting for a human" can be
+// days — the watcher runs until the ask is answered or disappears (404: it
+// was abandoned/dismissed or the bridge restarted), backing off from seconds
+// to 5-minute polls. Honest caveat: this watcher is in-memory, so a pod
+// restart drops it; the durable fallback is the platform-side answer path
+// (tenant-api handleAnswerAgentTask → prompt_async into the session), which
+// has no timer at all.
 async function watchAnswerDetached(id, where) {
-  const deadline = Date.now() + ASK_DETACHED_MS;
-  while (Date.now() < deadline) {
-    const w = await jfetch(`${BRIDGE}/ask/wait?id=${encodeURIComponent(id)}&timeout=4000`, {}, 15000).catch(() => null);
-    if (w && w.status === 404) return; // ask gone (bridge restarted)
+  const started = Date.now();
+  for (;;) {
+    const age = Date.now() - started;
+    // Backoff: near-instant for the first 10 min, 30s cadence up to 1h,
+    // then one poll every 5 min indefinitely.
+    const waitMs = age < 10 * 60 * 1000 ? 4000 : age < 60 * 60 * 1000 ? 25000 : 25000;
+    const sleepMs = age < 10 * 60 * 1000 ? 3000 : age < 60 * 60 * 1000 ? 5000 : 5 * 60 * 1000 - 25000;
+    const w = await jfetch(`${BRIDGE}/ask/wait?id=${encodeURIComponent(id)}&timeout=${waitMs}`, {}, waitMs + 10000).catch(() => null);
+    if (w && w.status === 404) return; // ask gone (abandoned / bridge restarted)
     if (w?.body?.answered) {
       if (where)
         await injectUserMessage(
@@ -221,13 +244,8 @@ async function watchAnswerDetached(id, where) {
         return;
       }
     }
-    await sleep(3000);
+    await sleep(sleepMs);
   }
-  jfetch(`${BRIDGE}/ask/abandon`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ id }),
-  }).catch(() => null);
 }
 
 async function askHuman({ question, kind, options }, ctx = {}) {
@@ -271,9 +289,9 @@ async function askHuman({ question, kind, options }, ctx = {}) {
   // late answer gets injected as a user message) and make the model STOP.
   watchAnswerDetached(id, where).catch(() => {});
   return (
-    "NO ANSWER YET. STOP NOW: end your turn without taking ANY further action. " +
-    "The human's answer will arrive as a new message and you will continue then. " +
-    "Acting without the answer is a policy violation."
+    `NO ANSWER YET after ${ASK_WAIT_MINUTES} minutes. STOP NOW: end your turn without taking ANY further action. ` +
+    "The question stays open — the human's answer (even days later) will arrive as a new message " +
+    "and you will continue then. Acting without the answer is a policy violation."
   );
 }
 
@@ -379,12 +397,12 @@ const TOOLS = {
     description:
       "Ask the human user a question and WAIT for their reply. Use for decisions, " +
       "missing info, credentials, or confirmation before something risky. The call " +
-      "BLOCKS until the answer arrives (up to ~10 min) and returns their exact words. " +
+      `BLOCKS until the answer arrives (up to ~${ASK_WAIT_MINUTES} min) and returns their exact words. ` +
       "HARD RULE: take NO further action until you have the answer. If it returns " +
       "NO ANSWER YET (or the call errors/times out), STOP and end your turn " +
-      "immediately — the answer will arrive as a new message and you continue then. " +
-      "Never perform destructive or irreversible actions between asking and receiving " +
-      "the answer.",
+      "immediately — the question stays open and the answer (even days later) arrives " +
+      "as a new message; you continue then. Never perform destructive or irreversible " +
+      "actions between asking and receiving the answer.",
     inputSchema: {
       type: "object",
       properties: {
