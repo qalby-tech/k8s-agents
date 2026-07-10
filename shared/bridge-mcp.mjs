@@ -3,7 +3,8 @@
 // agent-bridge on 127.0.0.1:4097 and (on a daemon) reuses the `fleet` CLI.
 //
 // Tools:
-//   ask_human(question)            both roles — ask the user, block for the reply
+//   ask_human(question)            both roles — post a question to the user; short
+//                                  grace wait, then park (answer delivered later)
 //   share_file(path, caption, from) both roles — put a file in the chat's outbox
 //   screenshot()                   daemon only — capture the VM screen, return it
 //                                  as a native image (vision models see it directly)
@@ -57,11 +58,20 @@ const TENANT = (() => {
 // executing an ask_human call and to deliver late answers into it.
 const OPENCODE = process.env.OPENCODE_BASE || "http://127.0.0.1:4096";
 const PROTOCOL_VERSION = "2024-11-05";
-// Active block: how long the ask_human tool call itself waits before returning
-// the STOP result. Workspace-configurable (TenantSpec ai.askWaitMinutes →
-// rendered into the daemon/master Secret as `ask_wait_minutes`, mounted at
-// /etc/aidaemon | /etc/aimaster); ASK_WAIT_MINUTES env overrides for dev.
-// Clamped 1..60, default 10.
+// ask_human does NOT block for the human anymore: opencode's MCP client
+// request timeout (~60s, not configurable from our bare opencode.jsonc mcp
+// block) killed long-blocking calls with "MCP error -32001: Request timed
+// out" — the model saw a tool FAILURE and carried on. Instead the tool posts
+// the question, waits only a short grace window (to catch a human who is
+// already watching the chat), then returns a clean PARK instruction and lets
+// the detached watcher deliver the answer later. ASK_GRACE_MS must stay well
+// under any MCP client timeout.
+const ASK_GRACE_MS = 8000;
+// ai.askWaitMinutes (TenantSpec → daemon/master Secret `ask_wait_minutes`,
+// mounted at /etc/aidaemon | /etc/aimaster; ASK_WAIT_MINUTES env for dev) is
+// still read and plumbed, but no longer governs an in-tool block — that block
+// is what triggered the -32001 failures. Kept for future use by reminder /
+// escalation cadence. Clamped 1..60, default 10.
 const ASK_WAIT_MINUTES = (() => {
   const parse = (s) => {
     const n = parseInt(String(s ?? "").trim(), 10);
@@ -77,7 +87,6 @@ const ASK_WAIT_MINUTES = (() => {
   }
   return 10;
 })();
-const ASK_TIMEOUT_MS = ASK_WAIT_MINUTES * 60 * 1000;
 // Daemon (has a VM) vs master. The screenshot tool only exists on a daemon.
 const IS_DAEMON = existsSync("/etc/aidaemon/vm_user");
 // Storage daemon (postgres/redis connection env injected by the chart): the
@@ -260,38 +269,53 @@ async function askHuman({ question, kind, options }, ctx = {}) {
   const where = await resolveAskSession(question).catch(() => null);
   const dupNote =
     "\n\n(Note: this answer may also appear as the next user message in this session — it is the SAME answer, do not treat it as a second instruction.)";
-  const deadline = Date.now() + ASK_TIMEOUT_MS;
+  // Short grace window only: catch a human who's already watching the chat.
+  // Anything longer risks the MCP client's own request timeout erroring the
+  // call — the park below is the normal path.
+  const deadline = Date.now() + ASK_GRACE_MS;
   let n = 0;
   while (Date.now() < deadline) {
-    // The MCP client cancelled this call (its own request timeout): our return
-    // value would be dropped, so switch to detached delivery.
+    // Belt-and-suspenders: if the client cancelled us even inside the grace
+    // window, our return value is dropped — go straight to detached delivery.
     if (ctx.isCancelled?.()) {
       watchAnswerDetached(id, where).catch(() => {});
       return "CANCELLED";
     }
-    // Progress notifications reset the client's request timeout when it
-    // supports that (MCP resetTimeoutOnProgress); harmless otherwise.
     if (ctx.progressToken !== undefined && ctx.progressToken !== null)
       send({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: ctx.progressToken, progress: ++n } });
-    const w = await jfetch(`${BRIDGE}/ask/wait?id=${encodeURIComponent(id)}&timeout=2000`, {}, 10000).catch(() => null);
-    if (w?.body?.answered) return `HUMAN ANSWER: ${w.body.answer}\n\nProceed accordingly.`;
+    const w = await jfetch(`${BRIDGE}/ask/wait?id=${encodeURIComponent(id)}&timeout=1500`, {}, 10000).catch(() => null);
+    if (w?.body?.answered) {
+      // Race guard: if the client cancelled while we were waiting, a normal
+      // return would be silently dropped — deliver via the session instead.
+      if (ctx.isCancelled?.()) {
+        if (where)
+          await injectUserMessage(
+            where.sid,
+            `HUMAN ANSWER: ${w.body.answer}\n\nThis answers your earlier ask_human question (that tool call had already ended). Continue with this answer.`,
+          );
+        return "CANCELLED";
+      }
+      return `HUMAN ANSWER: ${w.body.answer}\n\nProceed accordingly.`;
+    }
     if (where) {
       const msgs = await sessionMessages(where.sid);
       const ans = msgs && newUserAnswer(msgs, where.baseline);
       if (ans != null) {
         await settleBridgeAsk(id, ans); // stop the pending-ask surfacing
+        if (ctx.isCancelled?.()) return "CANCELLED"; // answer already sits in the session
         return `HUMAN ANSWER: ${ans}\n\nProceed accordingly.${dupNote}`;
       }
     }
-    await sleep(600);
+    await sleep(400);
   }
-  // No answer inside the active window. Keep watching in the background (a
-  // late answer gets injected as a user message) and make the model STOP.
+  // Normal path: PARK. The pending ask on the bridge is what pauses the
+  // platform task (tenant-api's watcher polls GET /ask); the detached watcher
+  // delivers the eventual answer into this session as a new user message.
   watchAnswerDetached(id, where).catch(() => {});
   return (
-    `NO ANSWER YET after ${ASK_WAIT_MINUTES} minutes. STOP NOW: end your turn without taking ANY further action. ` +
-    "The question stays open — the human's answer (even days later) will arrive as a new message " +
-    "and you will continue then. Acting without the answer is a policy violation."
+    "QUESTION POSTED — waiting on the human. STOP NOW: end your turn without any further action. " +
+    "You will be re-prompted with the answer (it arrives as a new message, possibly days later). " +
+    "Do not act, especially nothing destructive, until then."
   );
 }
 
@@ -395,14 +419,13 @@ async function searchCharts({ query, limit }) {
 const TOOLS = {
   ask_human: {
     description:
-      "Ask the human user a question and WAIT for their reply. Use for decisions, " +
-      "missing info, credentials, or confirmation before something risky. The call " +
-      `BLOCKS until the answer arrives (up to ~${ASK_WAIT_MINUTES} min) and returns their exact words. ` +
-      "HARD RULE: take NO further action until you have the answer. If it returns " +
-      "NO ANSWER YET (or the call errors/times out), STOP and end your turn " +
-      "immediately — the question stays open and the answer (even days later) arrives " +
-      "as a new message; you continue then. Never perform destructive or irreversible " +
-      "actions between asking and receiving the answer.",
+      "Ask the human user a question. Use for decisions, missing info, or " +
+      "confirmation before something risky. If the human is already watching it " +
+      "returns their exact words right away (HUMAN ANSWER: …); normally it returns " +
+      "QUESTION POSTED — then STOP: end your turn immediately without any further " +
+      "action; the answer arrives later (possibly days) as a new message and you " +
+      "continue then. HARD RULE: take NO action — especially nothing destructive or " +
+      "irreversible — between asking and receiving the answer.",
     inputSchema: {
       type: "object",
       properties: {
