@@ -19,6 +19,30 @@ const TARGETS_PATH = process.env.FLEET_TARGETS || "/etc/aimaster/targets.json";
 const BRIDGE = process.env.AGENT_BRIDGE || "http://127.0.0.1:4097"; // the master's own bridge
 const PROTOCOL_VERSION = "2024-11-05";
 
+// The platform API — slave daemons idle-sleep to ZERO replicas after ~30m
+// without chats or tasks, and this master's direct :4096 calls can't wake
+// them. tenant-api's agent-wake endpoint can (it scales the Deployment back
+// up). Auth is the same projected agent-sa token bridge-mcp uses; the tenant
+// name derives from the pod's namespace (tenant-<name>). All best-effort:
+// with tenant-api unreachable we fall through to the old direct behavior.
+const TENANT_API = process.env.TENANT_API || "http://tenant-api.tenant-api.svc.cluster.local:8080";
+const TENANT_API_TOKEN_PATH = process.env.TENANT_API_TOKEN_PATH || "/var/run/secrets/tenant-api/token";
+function apiAuthHeaders() {
+  try {
+    const tok = readFileSync(TENANT_API_TOKEN_PATH, "utf8").trim();
+    if (tok) return { authorization: `Bearer ${tok}` };
+  } catch {}
+  return {};
+}
+const TENANT = (() => {
+  if (process.env.TENANT_NAME) return process.env.TENANT_NAME;
+  try {
+    const ns = readFileSync("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "utf8").trim();
+    if (ns.startsWith("tenant-")) return ns.slice("tenant-".length);
+  } catch {}
+  return "";
+})();
+
 // A slave's agent-bridge (:4097) sits next to its opencode API (:4096). That's
 // where its pending ask_human question and its shared files live.
 const bridgeOf = (t) => t.daemonURL.replace(/\/+$/, "").replace(/:4096$/, ":4097");
@@ -62,6 +86,44 @@ function parseModel(m) {
   return { providerID: m.slice(0, i), modelID: m.slice(i + 1) };
 }
 
+// reachable — one quick probe of a slave's opencode API.
+async function reachable(base) {
+  try {
+    const r = await jfetch(`${base}/session`, {}, 3000);
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ensureAwake — make sure a slave daemon is up before we talk to it. Fast
+// path: one probe (an awake daemon costs ~nothing). Sleeping: ask tenant-api
+// to wake it (the endpoint itself waits up to ~20s and reports awake|waking),
+// then keep probing :4096. The whole thing is bounded WELL under opencode's
+// ~60s MCP tool timeout — a delegate that waits longer would be reported as
+// a tool FAILURE even though the wake succeeded. Returns true when the slave
+// is reachable; false when it's (probably) still waking, so the caller can
+// say "retry in a moment" instead of a bare connection error. Never throws:
+// without tenant-api (dev) this degrades to the old direct behavior.
+async function ensureAwake(t) {
+  const base = t.daemonURL.replace(/\/+$/, "");
+  if (await reachable(base)) return true;
+  const deadline = Date.now() + 45000;
+  if (TENANT) {
+    const r = await jfetch(
+      `${TENANT_API}/v1/tenants/${encodeURIComponent(TENANT)}/workloads/${encodeURIComponent(t.name)}/agent-wake`,
+      { method: "POST", headers: apiAuthHeaders() },
+      25000,
+    ).catch(() => null);
+    if (r?.ok && r.body?.status === "awake") return true;
+  }
+  while (Date.now() < deadline) {
+    if (await reachable(base)) return true;
+    await new Promise((res) => setTimeout(res, 2500));
+  }
+  return false;
+}
+
 // ── tools ────────────────────────────────────────────────────────────────────
 
 async function listAgents() {
@@ -81,13 +143,20 @@ async function delegate({ agent, task }) {
   if (!t) throw new Error(`unknown agent "${agent}" — call list_agents first`);
   const base = t.daemonURL.replace(/\/+$/, "");
 
+  // Idle slaves sleep to zero replicas — wake before connecting.
+  const awake = await ensureAwake(t);
   const created = await jfetch(`${base}/session`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ title: `via master: ${task.slice(0, 60)}` }),
-  });
-  if (!created.ok || !created.body?.id)
+  }).catch(() => ({ ok: false, status: 0, body: null }));
+  if (!created.ok || !created.body?.id) {
+    if (!awake)
+      throw new Error(
+        `agent "${agent}" was asleep and is still waking up — delegate the same task again in ~30 seconds`,
+      );
     throw new Error(`could not start a session on "${agent}" (status ${created.status})`);
+  }
   const sessionId = created.body.id;
 
   // Mark this session supervised on the slave's bridge BEFORE it starts, so the
@@ -211,6 +280,7 @@ async function answerAgent({ agent, answer }) {
   if (!agent || answer === undefined) throw new Error("answer_agent requires { agent, answer }");
   const t = findTarget(agent);
   if (!t) throw new Error(`unknown agent "${agent}"`);
+  await ensureAwake(t); // a blocked slave is normally held awake — belt and braces
   const bridge = bridgeOf(t);
   const ask = await jfetch(`${bridge}/ask`);
   const pending = ask.body?.pending;
@@ -231,6 +301,7 @@ async function reviewAgent({ agent, session, decision, feedback }) {
   if (!agent || !session || !decision) throw new Error("review_agent requires { agent, session, decision }");
   const t = findTarget(agent);
   if (!t) throw new Error(`unknown agent "${agent}"`);
+  await ensureAwake(t); // a slave parked on review is normally held awake — belt and braces
   const bridge = bridgeOf(t);
   const rev = await jfetch(`${bridge}/review?session=${encodeURIComponent(session)}`);
   const pending = rev.body?.pending;
