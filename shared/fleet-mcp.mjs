@@ -337,6 +337,67 @@ async function collectFile({ agent, name, caption }) {
   return `Collected "${safe}" from "${agent}" — it's now in this chat's attachments.`;
 }
 
+// ── loops (recurring scheduled tasks) ────────────────────────────────────────
+// A loop is a saved (schedule, agent, task) the platform fires on a cron cadence.
+// These call tenant-api's /loops API with the master's agent-sa token — the same
+// auth the wake path uses. tenant-api owns the scheduler; the master just curates
+// the schedule.
+const loopsURL = () => `${TENANT_API}/v1/tenants/${encodeURIComponent(TENANT)}/loops`;
+
+async function scheduleLoop({ name, agent, schedule, task, retries, timeout_minutes, skip_if_running, channel_id }) {
+  if (!TENANT) throw new Error("no tenant context");
+  if (!name || !agent || !schedule || !task)
+    throw new Error("name, agent, schedule and task are all required");
+  const body = {
+    workloadId: agent,
+    name,
+    prompt: task,
+    schedule,
+    guardrails: {
+      retries: Number.isInteger(retries) ? retries : 0,
+      timeoutMinutes: Number.isInteger(timeout_minutes) ? timeout_minutes : 0,
+      skipIfRunning: skip_if_running !== false,
+      channelId: channel_id || undefined,
+    },
+  };
+  const r = await jfetch(loopsURL(), {
+    method: "POST",
+    headers: { "content-type": "application/json", ...apiAuthHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const detail = typeof r.body === "string" ? r.body : r.body?.error || JSON.stringify(r.body);
+    throw new Error(`could not schedule loop (status ${r.status}): ${detail}`);
+  }
+  const l = r.body || {};
+  return `Scheduled loop "${l.name}" (${l.id}) — ${l.scheduleHuman || l.schedule}, runs ${agent} in ${l.timezone || "UTC"}. Next run: ${l.nextRunAt || "soon"}.`;
+}
+
+async function listLoops() {
+  if (!TENANT) throw new Error("no tenant context");
+  const r = await jfetch(loopsURL(), { headers: apiAuthHeaders() });
+  if (!r.ok) throw new Error(`could not list loops (status ${r.status})`);
+  const loops = r.body?.loops || [];
+  if (!loops.length) return "No loops scheduled yet.";
+  return loops
+    .map(
+      (l) =>
+        `• ${l.name} [${l.id}] — ${l.scheduleHuman || l.schedule}, runs ${l.workloadId} — ${l.enabled ? "active" : "paused"}${l.lastStatus ? `, last run ${l.lastStatus}` : ""}`,
+    )
+    .join("\n");
+}
+
+async function toggleLoop({ loop_id }) {
+  if (!TENANT) throw new Error("no tenant context");
+  if (!loop_id) throw new Error("loop_id is required (see list_loops)");
+  const r = await jfetch(`${loopsURL()}/${encodeURIComponent(loop_id)}/toggle`, {
+    method: "POST",
+    headers: apiAuthHeaders(),
+  });
+  if (!r.ok) throw new Error(`could not toggle loop (status ${r.status})`);
+  return `Loop ${loop_id} is now ${r.body?.enabled ? "active" : "paused"}.`;
+}
+
 const TOOLS = {
   list_agents: {
     description:
@@ -444,6 +505,47 @@ const TOOLS = {
       additionalProperties: false,
     },
     handler: collectFile,
+  },
+  schedule_loop: {
+    description:
+      "Schedule RECURRING work: run a task on one of your agents on a repeating cron cadence " +
+      "(a Loop). Use this instead of doing a one-off when the user wants something ongoing — " +
+      "'every morning check X', 'hourly triage', 'weekly digest'. The platform fires it for " +
+      "you and each run shows up like any other task.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "short human name, e.g. 'Morning account check'" },
+        agent: { type: "string", description: "which agent runs it — a name from list_agents" },
+        schedule: {
+          type: "string",
+          description: "cron ('0 8 * * *', '0 9-18 * * 1-5') or a macro (@hourly, @daily, @weekly)",
+        },
+        task: { type: "string", description: "the standalone instruction the agent runs each time" },
+        retries: { type: "integer", description: "retries on failure (0-5, default 0)" },
+        timeout_minutes: { type: "integer", description: "hard cap per run (default 30)" },
+        skip_if_running: { type: "boolean", description: "skip a fire if the previous run is still going (default true)" },
+        channel_id: { type: "string", description: "optional notification channel id to alert on failure" },
+      },
+      required: ["name", "agent", "schedule", "task"],
+      additionalProperties: false,
+    },
+    handler: scheduleLoop,
+  },
+  list_loops: {
+    description: "List the recurring loops scheduled in this workspace, with each one's id, cadence and status.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    handler: listLoops,
+  },
+  toggle_loop: {
+    description: "Pause or resume a loop (flips its enabled state). Pass a loop_id from list_loops.",
+    inputSchema: {
+      type: "object",
+      properties: { loop_id: { type: "string", description: "loop id from list_loops" } },
+      required: ["loop_id"],
+      additionalProperties: false,
+    },
+    handler: toggleLoop,
   },
 };
 
