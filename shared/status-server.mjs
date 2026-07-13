@@ -20,6 +20,7 @@
 // Attachments are per-session dirs (outbox/<session>, inbox/<session>); another
 // session can still read them by path on disk.
 import http from "node:http";
+import os from "node:os";
 import { execFile } from "node:child_process";
 import { readFile, readdir, stat, mkdir, unlink, writeFile, rm } from "node:fs/promises";
 import { createReadStream } from "node:fs";
@@ -31,6 +32,48 @@ const OUTBOX = process.env.AGENT_OUTBOX || "/workspace/outbox";
 const INBOX = process.env.AGENT_INBOX || "/workspace/inbox";
 const IS_DAEMON = await readFile("/etc/aidaemon/vm_user", "utf8").then(() => true).catch(() => false);
 const GUI = await readFile("/etc/aidaemon/vm_gui", "utf8").then((s) => s.trim() === "true").catch(() => false);
+const OPENCODE = process.env.OPENCODE_BASE || "http://127.0.0.1:4096";
+
+// ── busy PUSH to tenant-api (Phase 2 of the realtime rewrite) ─────────────────
+// This process shares the opencode container, so it can subscribe to opencode's
+// own /event SSE and POST busy-state TRANSITIONS to tenant-api's per-workspace
+// hub — turning the workspace "is this agent working?" dot into a push instead
+// of a browser poll. The /busy endpoint below stays the pulse fallback.
+//
+// Auth + identity mirror bridge-mcp.mjs: the chart mounts an audience-bound
+// agent-sa token (Authorization: Bearer) and TENANT derives from the pod
+// namespace (tenant-<name>). tenant-api's ownedTenant accepts the agent-sa.
+const TENANT_API = process.env.TENANT_API || "http://tenant-api.tenant-api.svc.cluster.local:8080";
+const TENANT_API_TOKEN_PATH = process.env.TENANT_API_TOKEN_PATH || "/var/run/secrets/tenant-api/token";
+async function apiAuthHeaders() {
+  try {
+    const tok = (await readFile(TENANT_API_TOKEN_PATH, "utf8")).trim();
+    if (tok) return { authorization: `Bearer ${tok}` };
+  } catch {}
+  return {};
+}
+const TENANT = await (async () => {
+  if (process.env.TENANT_NAME) return process.env.TENANT_NAME;
+  try {
+    const ns = (await readFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "utf8")).trim();
+    if (ns.startsWith("tenant-")) return ns.slice("tenant-".length);
+  } catch {}
+  return "";
+})();
+// This pod's own agent id, from the pod name (os.hostname() = the pod name for a
+// Deployment):  <tenant>-<id>-aidaemon-<rs>-<pod>  |  <tenant>-<id>-aimaster-…
+// tenant-api forms the hub key ("daemon:<id>"/"master:<id>") from the CR, so we
+// only need {id} for the URL. Robust against dashes in the id: strip the known
+// TENANT prefix, then cut at the fixed role token.
+const SELF_ID = (() => {
+  let host = os.hostname();
+  if (TENANT && host.startsWith(TENANT + "-")) host = host.slice(TENANT.length + 1);
+  for (const tok of ["-aidaemon", "-aimaster"]) {
+    const at = host.indexOf(tok);
+    if (at > 0) return host.slice(0, at);
+  }
+  return "";
+})();
 
 await mkdir(OUTBOX, { recursive: true }).catch(() => {});
 await mkdir(INBOX, { recursive: true }).catch(() => {});
@@ -203,6 +246,93 @@ async function busySweep() {
   busyAt = Date.now();
   return out;
 }
+
+// POST the current busy state to tenant-api's hub. Best-effort: if tenant-api is
+// unreachable we just skip — the /pulse in-cluster probe still covers it.
+async function postBusy(b) {
+  if (!TENANT || !SELF_ID) return;
+  const url = `${TENANT_API}/v1/tenants/${encodeURIComponent(TENANT)}/workloads/${encodeURIComponent(SELF_ID)}/agent-busy`;
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 5000);
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(await apiAuthHeaders()) },
+      body: JSON.stringify({ busy: b.busy, sessions: b.sessions || [], tasks: b.tasks || {} }),
+      signal: ac.signal,
+    });
+  } catch {
+    /* tenant-api unreachable — pulse fallback covers it */
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// Debounced busy-transition detector. opencode's /event SSE fires many frames
+// per turn; coalesce them into at most one fresh busySweep per 500ms, and POST
+// only when the boolean actually FLIPPED (lastBusy seeds false = idle at boot,
+// so a daemon that boots into a running task announces the going-busy edge).
+let lastBusy = false;
+let busyTimer = null;
+function scheduleBusyCheck() {
+  if (busyTimer) return; // already coalescing this window
+  busyTimer = setTimeout(async () => {
+    busyTimer = null;
+    let b;
+    try {
+      b = await busySweep(); // fresh sweep (also refreshes the /busy cache)
+    } catch {
+      return;
+    }
+    if (!b || b.busy === lastBusy) return; // no transition → no POST
+    lastBusy = b.busy;
+    postBusy(b);
+  }, 500);
+}
+
+// Only session/message lifecycle frames can change the busy boolean; skip the
+// rest (permission/file/server noise) so we don't sweep needlessly. Heartbeat /
+// comment-only frames carry no data: line.
+function busyRelevantFrame(frame) {
+  if (!frame.includes("data:")) return false;
+  return frame.includes("session") || frame.includes("message");
+}
+
+// Subscribe to opencode's own SSE event stream and drive the transition
+// detector. Reconnects with capped exponential backoff if the stream drops
+// (opencode restart, pod roll); a fresh connect re-seeds the baseline.
+async function streamOpencodeEvents() {
+  let backoff = 1000;
+  for (;;) {
+    try {
+      const res = await fetch(`${OPENCODE}/event`, { headers: { accept: "text/event-stream" } });
+      if (!res.ok || !res.body) throw new Error(`event stream ${res.status}`);
+      backoff = 1000; // healthy connect resets the backoff
+      scheduleBusyCheck(); // seed the baseline on (re)connect
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf("\n\n")) >= 0) {
+          const frame = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          if (busyRelevantFrame(frame)) scheduleBusyCheck();
+        }
+      }
+    } catch {
+      /* fall through to reconnect */
+    }
+    await new Promise((r) => setTimeout(r, backoff));
+    backoff = Math.min(backoff * 2, 30000);
+  }
+}
+// Push is in-cluster only: no TENANT/id (dev/standalone engine) → skip and let
+// the pulse probe be the sole busy source.
+if (TENANT && SELF_ID) streamOpencodeEvents();
 
 // ── delegated-agent watches (master only): wake the master on completion ──────
 // When the master delegates a task, fleet-mcp POSTs /watch here. We poll the
