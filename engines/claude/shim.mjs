@@ -47,7 +47,10 @@ const list = () =>
   fs.readdirSync(STATE_DIR).filter((f) => f.endsWith(".json"))
     .map((f) => load(f.slice(0, -5))).filter(Boolean);
 
-const procs = new Map(); // session id -> child process (for abort)
+// session id -> { child, s }: abort MUST mutate the same in-memory session
+// object the running turn closed over, or the flag never reaches it (and the
+// turn's final save would clobber a flag written to a reloaded copy).
+const procs = new Map();
 
 // ── the CLI turn ───────────────────────────────────────────────────────────
 // Streams stream-json events, folding them into ocMsg turns as they arrive so
@@ -71,7 +74,7 @@ function runTurn(s, prompt, model) {
     cwd: WORKDIR,
     env: { ...process.env, IS_SANDBOX: "1" },
   });
-  procs.set(s.id, child);
+  procs.set(s.id, { child, s });
   s.running = true;
   s.aborted = false;
   const turn = { role: "assistant", ts: 0, parts: [] };
@@ -104,6 +107,8 @@ function runTurn(s, prompt, model) {
     s.running = false;
     turn.ts = Date.now() / 1000;
     if (s.aborted) {
+      // Marked even when partial text arrived — the task layer distinguishes
+      // cancelled from done, and the partial output is kept for context.
       turn.error = { name: "aborted", message: "cancelled by the user" };
     } else if (code !== 0 && !turn.parts.some((p) => p.type === "text")) {
       const why = errTail.trim().split("\n").filter(Boolean).pop() || `claude exited ${code}`;
@@ -252,10 +257,14 @@ const server = http.createServer(async (req, res) => {
     }
     if (tail === "todo" && req.method === "GET") return send(res, 200, todosOf(s));
     if (tail === "abort" && req.method === "POST") {
-      const child = procs.get(s.id);
-      s.aborted = true;
-      save(s);
-      if (child) child.kill("SIGTERM");
+      const live = procs.get(s.id);
+      if (live) {
+        live.s.aborted = true; // the object the turn's close handler reads
+        live.child.kill("SIGTERM");
+      } else {
+        s.aborted = true;
+        save(s);
+      }
       return send(res, 200, {});
     }
     if ((tail === "prompt_async" || tail === "prompt") && req.method === "POST") {
