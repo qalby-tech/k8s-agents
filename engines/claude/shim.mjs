@@ -63,7 +63,14 @@ function runTurn(s, prompt, model) {
   // pod IS the sandbox (its own namespace, default-deny egress).
   args.push("--dangerously-skip-permissions");
 
-  const child = spawn("claude", args, { cwd: WORKDIR, env: process.env });
+  // IS_SANDBOX: the CLI refuses --dangerously-skip-permissions when running as
+  // root, which every engine pod does. This is the documented container escape
+  // hatch — and the claim is true here: the pod IS the sandbox (own namespace,
+  // default-deny egress, no host mounts).
+  const child = spawn("claude", args, {
+    cwd: WORKDIR,
+    env: { ...process.env, IS_SANDBOX: "1" },
+  });
   procs.set(s.id, child);
   s.running = true;
   s.aborted = false;
