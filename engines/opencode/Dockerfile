@@ -4,9 +4,10 @@ FROM node:22-slim
 
 # git: opencode repo/snapshot ops. curl: healthcheck. openssh-client + jq: `fleet`
 # (drives the target fleet over SSH; jq builds/parses cua /cmd). sshpass: the
-# one-time ssh-copy-id bootstrap onto the VM using its password.
+# one-time ssh-copy-id bootstrap onto the VM using its password. tini: a real
+# init for PID 1 — see the ENTRYPOINT note below.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates curl openssh-client jq sshpass postgresql-client redis-tools \
+    && apt-get install -y --no-install-recommends git ca-certificates curl openssh-client jq sshpass postgresql-client redis-tools tini \
     && rm -rf /var/lib/apt/lists/*
 
 # helm — agents use it read-only as a REFERENCE when deploying a known app:
@@ -50,4 +51,11 @@ ENV OPENCODE_DATA=/root/.local/share/opencode
 COPY shared/AGENTS.md.tmpl /workspace/AGENTS.md
 
 EXPOSE 4096 4097
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+# tini as PID 1, not the entrypoint script. `opencode serve` is not an init: it
+# never wait()s on processes it did not spawn, so anything re-parented to PID 1
+# stays <defunct> forever. Two things land there in daemon mode — the ssh
+# ControlPersist masters (they detach by design, so they orphan when the client
+# exits) and the helpers entrypoint.sh backgrounds before its `exec`. tini reaps
+# both. -g forwards signals to the whole process group so a pod delete still
+# stops the backgrounded helpers, not just opencode.
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/entrypoint.sh"]
