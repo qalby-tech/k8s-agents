@@ -73,6 +73,7 @@ function runTurn(s, prompt, model) {
   save(s);
 
   let buf = "";
+  let errTail = "";
   child.stdout.on("data", (chunk) => {
     buf += chunk.toString();
     let nl;
@@ -85,7 +86,12 @@ function runTurn(s, prompt, model) {
       handleEvent(s, turn, ev);
     }
   });
-  child.stderr.on("data", (d) => process.stderr.write(`[claude] ${d}`));
+  child.stderr.on("data", (d) => {
+    // Keep the tail so a failed turn can report WHY (an expired subscription
+    // token, a rate-limit window, a bad model id) instead of just an exit code.
+    errTail = (errTail + d.toString()).slice(-500);
+    process.stderr.write(`[claude] ${d}`);
+  });
   child.on("close", (code) => {
     procs.delete(s.id);
     s.running = false;
@@ -93,7 +99,8 @@ function runTurn(s, prompt, model) {
     if (s.aborted) {
       turn.error = { name: "aborted", message: "cancelled by the user" };
     } else if (code !== 0 && !turn.parts.some((p) => p.type === "text")) {
-      turn.error = { name: "engine_error", message: `claude exited ${code}` };
+      const why = errTail.trim().split("\n").filter(Boolean).pop() || `claude exited ${code}`;
+      turn.error = { name: "engine_error", message: why };
     }
     save(s);
   });
