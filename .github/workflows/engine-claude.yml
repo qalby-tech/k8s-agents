@@ -1,0 +1,19 @@
+name: engine-claude
+on:
+  push:
+    branches: [main]
+    paths:
+      - "engines/claude/**"
+      - "shared/**"
+      - ".github/workflows/engine-claude.yml"
+      - ".github/workflows/_docker.yml"
+  workflow_dispatch:
+jobs:
+  image:
+    uses: ./.github/workflows/_docker.yml
+    secrets: inherit
+    with:
+      project: engines/claude
+      prefix: claude
+      context: .
+      dockerfile: engines/claude/Dockerfile
