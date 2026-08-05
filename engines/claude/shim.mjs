@@ -383,6 +383,14 @@ const server = http.createServer(async (req, res) => {
       if (live) {
         live.s.aborted = true; // the object the turn's close handler reads
         live.child.kill("SIGTERM");
+        // A CLI mid-API-call can sit on SIGTERM; the session stays "busy"
+        // until the process dies, which blocks the interrupt-and-redirect
+        // flow. Escalate so an abort reliably frees the session fast.
+        setTimeout(() => {
+          if (procs.get(s.id)?.child === live.child) {
+            try { live.child.kill("SIGKILL"); } catch {}
+          }
+        }, 2000).unref();
       } else {
         s.aborted = true;
         save(s);
