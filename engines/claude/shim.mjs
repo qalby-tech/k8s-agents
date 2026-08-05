@@ -42,7 +42,27 @@ const load = (id) => {
 const save = (s) => {
   s.updated = Date.now() / 1000;
   fs.writeFileSync(sessPath(s.id), JSON.stringify(s));
+  // Every persisted change is a UI-visible change — that's the event bus.
+  broadcast({ type: "session.updated", properties: { sessionID: s.id, running: !!s.running } });
 };
+
+// ── /event bus ─────────────────────────────────────────────────────────────
+// SSE mirror of opencode's GET /event, so the chat UI can listen instead of
+// polling. Consumers are schema-blind: they only look for their session id in
+// the event line, so the tiny session.updated envelope is all we need.
+const eventClients = new Set();
+function broadcast(obj) {
+  const line = `data: ${JSON.stringify(obj)}\n\n`;
+  for (const res of eventClients) {
+    try { res.write(line); } catch { eventClients.delete(res); }
+  }
+}
+setInterval(() => {
+  // Comment-line heartbeat keeps the gateway/browser from timing the stream out.
+  for (const res of eventClients) {
+    try { res.write(": ping\n\n"); } catch { eventClients.delete(res); }
+  }
+}, 25000).unref();
 const list = () =>
   fs.readdirSync(STATE_DIR).filter((f) => f.endsWith(".json"))
     .map((f) => load(f.slice(0, -5))).filter(Boolean);
@@ -217,6 +237,18 @@ const readBody = (req) => new Promise((resolve) => {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   const seg = url.pathname.split("/").filter(Boolean);
+
+  if (req.method === "GET" && url.pathname === "/event") {
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+    res.write(`data: ${JSON.stringify({ type: "server.connected", properties: {} })}\n\n`);
+    eventClients.add(res);
+    req.on("close", () => eventClients.delete(res));
+    return;
+  }
 
   if (req.method === "GET" && url.pathname === "/health/ready") {
     return send(res, 200, {
