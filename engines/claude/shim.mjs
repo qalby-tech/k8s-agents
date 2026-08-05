@@ -238,6 +238,19 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   const seg = url.pathname.split("/").filter(Boolean);
 
+  if (req.method === "GET" && url.pathname === "/config/providers") {
+    // The chat's model picker speaks opencode's /config/providers shape. The
+    // CLI takes model aliases, and every Claude model reads images (the chat's
+    // attachment flow materializes files into /workspace/inbox, which the
+    // agent opens with its own Read tool), so image capability is true.
+    const providerID = process.env.CLAUDE_PROVIDER_ID || "claude-subscription";
+    const model = (id) => [id, { capabilities: { input: { image: true } } }];
+    return send(res, 200, {
+      providers: [{ id: providerID, models: Object.fromEntries([model("sonnet"), model("opus"), model("haiku")]) }],
+      default: { [providerID]: "sonnet" },
+    });
+  }
+
   if (req.method === "GET" && url.pathname === "/event") {
     res.writeHead(200, {
       "content-type": "text/event-stream",

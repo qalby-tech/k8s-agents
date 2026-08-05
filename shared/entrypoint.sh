@@ -95,6 +95,10 @@ if [ "$ENGINE" = "claude" ]; then
       *) export ANTHROPIC_API_KEY="$PROVIDER_KEY" ;;
     esac
   fi
+  # The auth.json top-level key IS the connected provider id — the shim echoes
+  # it from /config/providers so the chat's model picker matches by id.
+  CLAUDE_PROVIDER_ID=$(jq -r 'keys[0] // empty' "$AUTH" 2>/dev/null || true)
+  export CLAUDE_PROVIDER_ID="${CLAUDE_PROVIDER_ID:-claude-subscription}"
   mkdir -p /data/shim
   printf '{ "mcpServers": { %s } }' "$MCP_SERVERS" > /root/claude-mcp.json
   export CLAUDE_MCP_CONFIG=/root/claude-mcp.json
