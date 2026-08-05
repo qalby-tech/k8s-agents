@@ -72,6 +72,78 @@ const list = () =>
 // turn's final save would clobber a flag written to a reloaded copy).
 const procs = new Map();
 
+// ── models ─────────────────────────────────────────────────────────────────
+// Live model discovery: GET /v1/models with the pod's own credential (verified
+// working for subscription OAuth tokens with the oauth beta header). Cached
+// 10 min in memory and persisted as last-known-good, so an expired token or a
+// network blip degrades to yesterday's list instead of an empty picker. The
+// static alias list is the bootstrap of last resort only.
+const MODELS_CACHE = path.join(STATE_DIR, "models.json");
+let modelsMem = { at: 0, list: null };
+function anthropicHeaders() {
+  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+    return {
+      authorization: `Bearer ${process.env.CLAUDE_CODE_OAUTH_TOKEN}`,
+      "anthropic-beta": "oauth-2025-04-20",
+      "anthropic-version": "2023-06-01",
+    };
+  }
+  if (process.env.ANTHROPIC_API_KEY) {
+    return { "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" };
+  }
+  return null;
+}
+async function listModels() {
+  if (modelsMem.list && Date.now() - modelsMem.at < 600_000) return modelsMem.list;
+  const headers = anthropicHeaders();
+  if (headers) {
+    try {
+      const r = await fetch("https://api.anthropic.com/v1/models?limit=100", { headers });
+      if (r.ok) {
+        const j = await r.json();
+        const list = (j.data ?? [])
+          .filter((m) => m.type === "model" && m.id)
+          .map((m) => ({ id: m.id, image: m.capabilities?.image_input?.supported !== false }));
+        if (list.length) {
+          modelsMem = { at: Date.now(), list };
+          try { fs.writeFileSync(MODELS_CACHE, JSON.stringify(list)); } catch {}
+          return list;
+        }
+      }
+    } catch {}
+  }
+  try {
+    const list = JSON.parse(fs.readFileSync(MODELS_CACHE, "utf8"));
+    if (Array.isArray(list) && list.length) return list;
+  } catch {}
+  // Bootstrap fallback: the CLI's documented aliases (claude --help).
+  return ["sonnet", "opus", "haiku"].map((id) => ({ id, image: true }));
+}
+
+// friendlyError turns the CLI's failure text into something a user can act
+// on. A subscription is a living credential — it expires, gets revoked, and
+// has usage windows — so those cases must not surface as raw stderr.
+function friendlyError(text) {
+  const t = String(text || "");
+  if (/not logged in|please run \/login|oauth.*(expired|revoked|invalid)|invalid (api key|bearer)|authentication|unauthorized|401/i.test(t)) {
+    return {
+      name: "auth_failed",
+      message:
+        "Claude rejected the credential — the subscription token has likely expired or been revoked. " +
+        "Run `claude setup-token` again and reconnect the provider on the Integrations page.",
+    };
+  }
+  if (/rate.?limit|usage limit|limit reached|overloaded|429|exceeds/i.test(t)) {
+    return {
+      name: "rate_limited",
+      message:
+        "Your Claude plan hit its usage window. It resets automatically — try again in a bit, " +
+        "or switch this agent to another provider meanwhile.",
+    };
+  }
+  return null;
+}
+
 // ── the CLI turn ───────────────────────────────────────────────────────────
 // Streams stream-json events, folding them into ocMsg turns as they arrive so
 // GET /message reflects a run in flight (that's how the UI shows live steps).
@@ -132,7 +204,7 @@ function runTurn(s, prompt, model) {
       turn.error = { name: "aborted", message: "cancelled by the user" };
     } else if (code !== 0 && !turn.parts.some((p) => p.type === "text")) {
       const why = errTail.trim().split("\n").filter(Boolean).pop() || `claude exited ${code}`;
-      turn.error = { name: "engine_error", message: why };
+      turn.error = friendlyError(errTail) ?? { name: "engine_error", message: why };
     }
     save(s);
   });
@@ -182,7 +254,8 @@ function handleEvent(s, turn, ev) {
       return;
     case "result": {
       if (ev.subtype !== "success" && !turn.parts.some((p) => p.type === "text")) {
-        turn.error = { name: ev.subtype || "error", message: ev.result || "run failed" };
+        turn.error =
+          friendlyError(ev.result) ?? { name: ev.subtype || "error", message: ev.result || "run failed" };
       } else if (ev.result?.trim() && !turn.parts.some((p) => p.type === "text")) {
         turn.parts.push({ type: "text", text: ev.result });
       }
@@ -240,14 +313,18 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && url.pathname === "/config/providers") {
     // The chat's model picker speaks opencode's /config/providers shape. The
-    // CLI takes model aliases, and every Claude model reads images (the chat's
-    // attachment flow materializes files into /workspace/inbox, which the
-    // agent opens with its own Read tool), so image capability is true.
+    // list is fetched LIVE from Anthropic's models API with the pod's own
+    // credential, so it is exactly what this subscription (or API key) can
+    // use — fable shows up on plans that have it, and nothing is hardcoded.
     const providerID = process.env.CLAUDE_PROVIDER_ID || "claude-subscription";
-    const model = (id) => [id, { capabilities: { input: { image: true } } }];
+    const models = await listModels();
     return send(res, 200, {
-      providers: [{ id: providerID, models: Object.fromEntries([model("sonnet"), model("opus"), model("haiku")]) }],
-      default: { [providerID]: "sonnet" },
+      providers: [{
+        id: providerID,
+        models: Object.fromEntries(models.map((m) => [m.id, { capabilities: { input: { image: m.image } } }])),
+      }],
+      // API order is newest-first; the first entry is the plan's best model.
+      default: { [providerID]: models[0]?.id ?? "" },
     });
   }
 
