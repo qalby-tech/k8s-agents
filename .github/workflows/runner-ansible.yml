@@ -1,0 +1,18 @@
+name: runner-ansible
+on:
+  push:
+    branches: [main]
+    paths:
+      - "runners/ansible/**"
+      - ".github/workflows/runner-ansible.yml"
+      - ".github/workflows/_docker.yml"
+  workflow_dispatch:
+jobs:
+  image:
+    uses: ./.github/workflows/_docker.yml
+    secrets: inherit
+    with:
+      project: runners/ansible
+      prefix: ansible
+      context: .
+      dockerfile: runners/ansible/Dockerfile

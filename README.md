@@ -18,6 +18,7 @@ engine pointed at other engines (orchestrator-daemon, not a new service).
 | --- | --- |
 | `engines/opencode/` | The daemon image: `opencode serve` on :4096, the `fleet` wrapper, the one-time VM bootstrap (`agent-bootstrap`), and the guest-status server on :4097. Tag `opencode-<v>`. |
 | `engines/claude/` | Claude-engine variant (WIP). |
+| `runners/ansible/` | The state-apply runner: converges a VM to its `<vm>-state` repo over SSH. Run as a one-shot Job by tenant-api on a push, not a long-lived agent. |
 | `shared/` | `fleet` (the agent's SSH/cua interface to its VM), `agent-bootstrap` (ssh-copy-id + cua install over SSH), `entrypoint.sh`, `status-server.mjs`, `AGENTS.md.tmpl`. |
 
 ## How the daemon controls its VM
