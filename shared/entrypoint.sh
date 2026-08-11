@@ -1,6 +1,6 @@
 #!/bin/sh
-# Engine entrypoint — shared by the opencode and claude engines (AGENT_ENGINE
-# selects; it defaults to whichever binary is present). When the engine is
+# Engine entrypoint — shared by the opencode, claude and codex engines
+# (AGENT_ENGINE selects; it defaults to whichever binary is present). When the engine is
 # acting as a per-VM AI daemon
 # (the <res>-aidaemon Secret is mounted at /etc/aidaemon), run the one-time VM
 # bootstrap in the background — so the opencode API is up immediately while the
@@ -107,6 +107,48 @@ if [ "$ENGINE" = "claude" ]; then
   [ -f /etc/aidaemon/model ] && export CLAUDE_MODEL="$(cat /etc/aidaemon/model)"
   [ -f /etc/aimaster/model ] && export CLAUDE_MODEL="$(cat /etc/aimaster/model)"
   exec node /usr/local/bin/claude-shim.mjs
+fi
+
+if [ "$ENGINE" = "codex" ]; then
+  # codex reads MCP servers + policies from CODEX_HOME/config.toml. CODEX_HOME
+  # is on the data volume (Dockerfile): the CLI refreshes subscription tokens
+  # in auth.json, so unlike claude the credential must be writable.
+  CODEX_HOME="${CODEX_HOME:-/data/codex}"
+  export CODEX_HOME
+  mkdir -p "$CODEX_HOME" /data/shim
+  {
+    echo '[mcp_servers.bridge]'
+    echo 'command = "node"'
+    echo 'args = ["/usr/local/bin/bridge-mcp.mjs"]'
+    if [ -f /etc/aimaster/targets.json ]; then
+      echo '[mcp_servers.fleet]'
+      echo 'command = "node"'
+      echo 'args = ["/usr/local/bin/fleet-mcp.mjs"]'
+      echo '[mcp_servers.fleet.env]'
+      echo 'FLEET_TARGETS = "/etc/aimaster/targets.json"'
+    fi
+  } > "$CODEX_HOME/config.toml"
+  # Auth from the SAME provider Secret every engine mounts. Two shapes:
+  #   sk-…       an OpenAI API key → env + auth.json
+  #   {…}        a pasted codex auth file (ChatGPT subscription: the user runs
+  #              `codex login` on their machine and pastes ~/.codex/auth.json)
+  if [ -n "$PROVIDER_KEY" ]; then
+    case "$PROVIDER_KEY" in
+      "{"*) printf '%s' "$PROVIDER_KEY" > "$CODEX_HOME/auth.json" ;;
+      *)
+        export OPENAI_API_KEY="$PROVIDER_KEY"
+        printf '{ "OPENAI_API_KEY": "%s" }' "$PROVIDER_KEY" > "$CODEX_HOME/auth.json"
+        ;;
+    esac
+    chmod 600 "$CODEX_HOME/auth.json" 2>/dev/null || true
+  fi
+  # The auth.json top-level key IS the connected provider id — the shim echoes
+  # it from /config/providers so the chat's model picker matches by id.
+  CODEX_PROVIDER_ID=$(jq -r 'keys[0] // empty' "$AUTH" 2>/dev/null || true)
+  export CODEX_PROVIDER_ID="${CODEX_PROVIDER_ID:-chatgpt-subscription}"
+  [ -f /etc/aidaemon/model ] && export CODEX_MODEL="$(cat /etc/aidaemon/model)"
+  [ -f /etc/aimaster/model ] && export CODEX_MODEL="$(cat /etc/aimaster/model)"
+  exec node /usr/local/bin/codex-shim.mjs
 fi
 
 exec opencode serve --hostname 0.0.0.0 --port 4096
