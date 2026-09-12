@@ -1,5 +1,0 @@
-[
-  { "name": "web1",  "kind": "terminal", "os": "linux"   },
-  { "name": "desk1", "kind": "gui",      "os": "linux"   },
-  { "name": "win1",  "kind": "gui",      "os": "windows" }
-]
